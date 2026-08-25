@@ -1,9 +1,10 @@
 import discord
 from discord.ext import commands
-from fastapi import FastAPI, HTTPException, Request, Header, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, Header, WebSocket, WebSocketDisconnect, Query
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from cogs.criptografia import encriptar_dado, decriptar_dado
 import sqlite3
 import uvicorn
 import asyncio
@@ -171,6 +172,30 @@ def init_dbs():
             )
         ''')
 
+        # --- TABELA SAAS: LICENÇAS E AFILIADOS MULTI-TENANT ---
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS licencas_afiliados (
+                chave_licenca TEXT PRIMARY KEY,
+                discord_user_id TEXT,
+                nome_usuario TEXT,
+                guild_id TEXT,
+                canal_discord_id TEXT,
+                tag_amazon TEXT,
+                tag_ml TEXT,
+                tag_shopee TEXT,
+                tag_magalu TEXT,
+                twitter_api_key_enc TEXT,
+                twitter_api_secret_enc TEXT,
+                twitter_access_token_enc TEXT,
+                twitter_access_secret_enc TEXT,
+                threads_user_id_enc TEXT,
+                threads_access_token_enc TEXT,
+                status TEXT DEFAULT 'ativo',
+                expira_em INTEGER,
+                criado_em INTEGER
+            )
+        ''')
+
 init_dbs()
 
 # --- FUNÇÃO AUXILIAR PARA REGISTRAR GANHOS ---
@@ -255,6 +280,52 @@ class ToggleLembreteRequest(BaseModel):
     user_id: str
     ativo: int
 
+# --- MODELOS SAAS: LICENÇAS E CONFIGURAÇÕES MULTI-TENANT ---
+
+class SalvarConfigLicencaRequest(BaseModel):
+    chave_licenca: str
+    nome_usuario: Optional[str] = ""
+    guild_id: Optional[str] = ""
+    canal_discord_id: Optional[str] = ""
+    tag_amazon: Optional[str] = ""
+    tag_ml: Optional[str] = ""
+    tag_shopee: Optional[str] = ""
+    tag_magalu: Optional[str] = ""
+    # Credenciais do Twitter (serão encriptadas antes de salvar)
+    twitter_api_key: Optional[str] = ""
+    twitter_api_secret: Optional[str] = ""
+    twitter_access_token: Optional[str] = ""
+    twitter_access_secret: Optional[str] = ""
+    # Credenciais do Threads (serão encriptadas antes de salvar)
+    threads_user_id: Optional[str] = ""
+    threads_access_token: Optional[str] = ""
+
+class CheckoutLicencaRequest(BaseModel):
+    chave_licenca: Optional[str] = ""
+    discord_user_id: Optional[str] = "anonimo"
+    nome_usuario: Optional[str] = ""
+
+class GerarTrialRequest(BaseModel):
+    discord_user_id: str
+    nome_usuario: Optional[str] = ""
+    canal_discord_id: Optional[str] = ""
+    guild_id: Optional[str] = ""
+
+class PostarLicencaRequest(BaseModel):
+    chave_licenca: str
+    titulo: str
+    link: str
+    preco_de: Optional[str] = ""
+    preco_por: Optional[str] = ""
+    descricao_extra: Optional[str] = ""
+    cupom: Optional[str] = ""
+    loja: Optional[str] = "Mercado Livre"
+    vendedor: Optional[str] = ""
+    imagem_url: Optional[str] = ""
+    postar_discord: bool = True
+    postar_twitter: bool = False
+    postar_threads: bool = False
+
 # ==========================================
 #  ROTAS: MERCADO PAGO E SISTEMA VIP
 # ==========================================
@@ -296,22 +367,53 @@ async def webhook_mercadopago(request: Request):
             payment = payment_info["response"]
             
             if payment.get("status") == "approved":
-                discord_id = payment.get("external_reference")
+                ext_ref = payment.get("external_reference")
                 itens = payment.get("additional_info", {}).get("items", [])
                 
-                if discord_id and itens:
+                if ext_ref and itens:
                     item_comprado = itens[0].get("id")
                     
-                    bot = app.state.bot_instance
-                    if bot:
-                        asyncio.run_coroutine_threadsafe(
-                            processar_entrega_vip(bot, discord_id, item_comprado),
-                            bot.loop
-                        )
+                    # 1. RENOVAÇÃO DE LICENÇA SAAS DE AFILIADOS (R$ 20/MÊS)
+                    if ext_ref.startswith("BIFES_PRO_") or item_comprado == "plano_pro_afiliados":
+                        processar_renovacao_licenca(ext_ref)
+                    else:
+                        # 2. SISTEMA VIP CONVENCIONAL
+                        bot = app.state.bot_instance
+                        if bot:
+                            asyncio.run_coroutine_threadsafe(
+                                processar_entrega_vip(bot, ext_ref, item_comprado),
+                                bot.loop
+                            )
         except Exception as e:
             print(f"Erro no Webhook: {e}")
 
     return {"status": "ok"}
+
+def processar_renovacao_licenca(chave_licenca: str):
+    """ Adiciona +30 dias na licença do cliente ao confirmar o pagamento """
+    conn = get_db_bifinhos()
+    c = conn.cursor()
+    c.execute("SELECT expira_em FROM licencas_afiliados WHERE chave_licenca = ?", (chave_licenca,))
+    row = c.fetchone()
+    
+    now_ts = int(time.time())
+    base_ts = now_ts
+    if row and row['expira_em'] and row['expira_em'] > now_ts:
+        base_ts = row['expira_em'] # Se ainda estava ativa, acumula +30 dias a partir da data futura
+        
+    novo_expira_em = base_ts + (30 * 24 * 60 * 60)
+    
+    if row:
+        c.execute("UPDATE licencas_afiliados SET expira_em = ?, status = 'ativo' WHERE chave_licenca = ?", (novo_expira_em, chave_licenca))
+    else:
+        c.execute("""
+            INSERT INTO licencas_afiliados (chave_licenca, status, expira_em, criado_em)
+            VALUES (?, 'ativo', ?, ?)
+        """, (chave_licenca, novo_expira_em, now_ts))
+        
+    conn.commit()
+    conn.close()
+    print(f"💎 [SaaS] Licença renovada com sucesso por +30 dias: {chave_licenca}")
 
 
 async def processar_entrega_vip(bot, discord_id: str, item_id: str):
@@ -1075,9 +1177,341 @@ def executar_post_threads(data):
                           params={'creation_id': res.json()['id'], 'access_token': THREADS_ACCESS_TOKEN})
     except Exception as e: print(f"Erro Threads: {e}")
 
-# ==========================================
-#  COG DO BOT (Carrega a API)
-# ==========================================
+# ===================================================
+#  ROTAS SAAS: LICENÇAS, AFILIADOS E CRIPTOGRAFIA
+# ===================================================
+
+@app.get("/api/licenca/verificar")
+def verificar_licenca(chave: str = Query(...)):
+    conn = get_db_bifinhos()
+    c = conn.cursor()
+    c.execute("SELECT * FROM licencas_afiliados WHERE chave_licenca = ?", (chave.strip(),))
+    row = c.fetchone()
+    conn.close()
+    
+    if not row:
+        return {
+            "status": "invalido",
+            "valido": False,
+            "mensagem": "Chave de licença não encontrada."
+        }
+        
+    now_ts = int(time.time())
+    expira_em = row['expira_em'] or 0
+    dias_restantes = max(0, int((expira_em - now_ts) / (24 * 60 * 60)))
+    
+    is_ativo = now_ts <= expira_em
+    status_label = "ativo" if is_ativo else "expirado"
+    
+    data_expira_str = datetime.fromtimestamp(expira_em).strftime("%d/%m/%Y") if expira_em > 0 else "Nunca"
+    
+    has_twitter = bool(row['twitter_api_key_enc'] and row['twitter_access_token_enc'])
+    has_threads = bool(row['threads_user_id_enc'] and row['threads_access_token_enc'])
+    
+    return {
+        "status": status_label,
+        "valido": is_ativo,
+        "dias_restantes": dias_restantes,
+        "expira_em": data_expira_str,
+        "plano": "PRO",
+        "canal_discord_id": row['canal_discord_id'] or "",
+        "tags": {
+            "amazon": row['tag_amazon'] or "",
+            "ml": row['tag_ml'] or "",
+            "shopee": row['tag_shopee'] or "",
+            "magalu": row['tag_magalu'] or ""
+        },
+        "integracoes": {
+            "twitter_conectado": has_twitter,
+            "threads_conectado": has_threads
+        }
+    }
+
+@app.post("/api/licenca/salvar_configuracoes")
+def salvar_configuracoes_licenca(data: SalvarConfigLicencaRequest):
+    conn = get_db_bifinhos()
+    c = conn.cursor()
+    c.execute("SELECT * FROM licencas_afiliados WHERE chave_licenca = ?", (data.chave_licenca.strip(),))
+    row = c.fetchone()
+    
+    if not row:
+        conn.close()
+        raise HTTPException(404, "Licença não encontrada.")
+        
+    # Criptografa credenciais sensíveis antes de persistir
+    tw_key_enc = encriptar_dado(data.twitter_api_key) if data.twitter_api_key else row['twitter_api_key_enc']
+    tw_sec_enc = encriptar_dado(data.twitter_api_secret) if data.twitter_api_secret else row['twitter_api_secret_enc']
+    tw_tok_enc = encriptar_dado(data.twitter_access_token) if data.twitter_access_token else row['twitter_access_token_enc']
+    tw_toksec_enc = encriptar_dado(data.twitter_access_secret) if data.twitter_access_secret else row['twitter_access_secret_enc']
+    
+    th_uid_enc = encriptar_dado(data.threads_user_id) if data.threads_user_id else row['threads_user_id_enc']
+    th_tok_enc = encriptar_dado(data.threads_access_token) if data.threads_access_token else row['threads_access_token_enc']
+    
+    c.execute("""
+        UPDATE licencas_afiliados SET
+            nome_usuario = coalesce(nullif(?, ''), nome_usuario),
+            guild_id = coalesce(nullif(?, ''), guild_id),
+            canal_discord_id = coalesce(nullif(?, ''), canal_discord_id),
+            tag_amazon = ?,
+            tag_ml = ?,
+            tag_shopee = ?,
+            tag_magalu = ?,
+            twitter_api_key_enc = ?,
+            twitter_api_secret_enc = ?,
+            twitter_access_token_enc = ?,
+            twitter_access_secret_enc = ?,
+            threads_user_id_enc = ?,
+            threads_access_token_enc = ?
+        WHERE chave_licenca = ?
+    """, (
+        data.nome_usuario, data.guild_id, data.canal_discord_id,
+        data.tag_amazon, data.tag_ml, data.tag_shopee, data.tag_magalu,
+        tw_key_enc, tw_sec_enc, tw_tok_enc, tw_toksec_enc,
+        th_uid_enc, th_tok_enc, data.chave_licenca.strip()
+    ))
+    
+    conn.commit()
+    conn.close()
+    return {"status": "success", "msg": "Configurações e credenciais salvas de forma 100% criptografada!"}
+
+@app.post("/api/licenca/gerar_trial")
+def gerar_trial_licenca(data: GerarTrialRequest):
+    conn = get_db_bifinhos()
+    c = conn.cursor()
+    
+    # Verifica se o usuário do Discord já possui uma licença
+    c.execute("SELECT chave_licenca, expira_em FROM licencas_afiliados WHERE discord_user_id = ?", (data.discord_user_id,))
+    row = c.fetchone()
+    
+    now_ts = int(time.time())
+    if row:
+        conn.close()
+        return {
+            "status": "existente",
+            "chave_licenca": row['chave_licenca'],
+            "msg": "Você já possui uma chave cadastrada!"
+        }
+        
+    nova_chave = f"BIFES_PRO_{secrets.token_hex(6).upper()}"
+    expira_em = now_ts + (3 * 24 * 60 * 60) # 3 Dias de Trial Grátis
+    
+    c.execute("""
+        INSERT INTO licencas_afiliados (chave_licenca, discord_user_id, nome_usuario, guild_id, canal_discord_id, status, expira_em, criado_em)
+        VALUES (?, ?, ?, ?, ?, 'trial', ?, ?)
+    """, (nova_chave, data.discord_user_id, data.nome_usuario, data.guild_id, data.canal_discord_id, expira_em, now_ts))
+    
+    conn.commit()
+    conn.close()
+    return {
+        "status": "success",
+        "chave_licenca": nova_chave,
+        "dias_trial": 3,
+        "msg": "Licença Trial de 3 dias criada com sucesso!"
+    }
+
+@app.post("/api/licenca/checkout_mercadopago")
+def checkout_licenca_mercadopago(data: CheckoutLicencaRequest):
+    chave = data.chave_licenca.strip() if data.chave_licenca else f"BIFES_PRO_{secrets.token_hex(6).upper()}"
+    
+    # Cria licença se ainda não existir no banco
+    conn = get_db_bifinhos()
+    c = conn.cursor()
+    c.execute("SELECT chave_licenca FROM licencas_afiliados WHERE chave_licenca = ?", (chave,))
+    if not c.fetchone():
+        now_ts = int(time.time())
+        c.execute("""
+            INSERT INTO licencas_afiliados (chave_licenca, discord_user_id, nome_usuario, status, expira_em, criado_em)
+            VALUES (?, ?, ?, 'pendente', 0, ?)
+        """, (chave, data.discord_user_id, data.nome_usuario, now_ts))
+        conn.commit()
+    conn.close()
+    
+    preference_data = {
+        "items": [
+            {
+                "id": "plano_pro_afiliados",
+                "title": "Bifes Promo Pro - Assinatura Mensal (30 Dias)",
+                "description": "Acesso ilimitado à Extensão de Promoções, botões no Discord e redes sociais.",
+                "quantity": 1,
+                "currency_id": "BRL",
+                "unit_price": 20.00
+            }
+        ],
+        "external_reference": chave,
+        "notification_url": "https://api.bifes.com.br/api/pagamento/webhook",
+        "back_urls": {
+            "success": "https://bifes.com.br/painel?status=sucesso",
+            "failure": "https://bifes.com.br/painel?status=erro",
+            "pending": "https://bifes.com.br/painel?status=pendente"
+        },
+        "auto_return": "approved"
+    }
+
+    preference_response = mp_sdk.preference().create(preference_data)
+    return {
+        "status": "success",
+        "chave_licenca": chave,
+        "link_pagamento": preference_response["response"]["init_point"]
+    }
+
+@app.post("/api/licenca/postar")
+def postar_via_licenca(data: PostarLicencaRequest):
+    chave = data.chave_licenca.strip()
+    conn = get_db_bifinhos()
+    c = conn.cursor()
+    c.execute("SELECT * FROM licencas_afiliados WHERE chave_licenca = ?", (chave,))
+    row = c.fetchone()
+    conn.close()
+    
+    if not row:
+        raise HTTPException(401, "Chave de licença não encontrada ou inválida.")
+        
+    now_ts = int(time.time())
+    if not row['expira_em'] or now_ts > row['expira_em']:
+        raise HTTPException(403, "Sua licença expirou. Renove sua assinatura por R$ 20/mês para continuar postando.")
+        
+    mlb_id = f"ext_{int(time.time())}_{random.randint(100, 999)}"
+    
+    if data.imagem_url:
+        baixar_imagem_url(data.imagem_url, mlb_id)
+        
+    bot = app.state.bot_instance
+    if not bot:
+        raise HTTPException(500, "Bot desconectado no momento.")
+        
+    # Injeção automática das tags de afiliado da licença
+    link_final = data.link
+    if data.loja == "Amazon" and row['tag_amazon']:
+        clean = link_final.split('?')[0]
+        link_final = f"{clean}?tag={row['tag_amazon']}"
+    elif data.loja == "Mercado Livre" and row['tag_ml'] and "matt_tool" not in link_final:
+        sep = "&" if "?" in link_final else "?"
+        link_final = f"{link_final}{sep}tag={row['tag_ml']}"
+        
+    data.link = link_final
+    
+    # 1. Posta no Discord do cliente
+    canal_dest = int(row['canal_discord_id']) if row['canal_discord_id'] else int(ML_CHANNEL_ID)
+    if data.postar_discord:
+        asyncio.run_coroutine_threadsafe(postar_discord_cliente(bot, canal_dest, row, data, mlb_id), bot.loop)
+        
+    # 2. Posta no Twitter do cliente com credenciais descriptografadas em memória
+    if data.postar_twitter and row['twitter_api_key_enc']:
+        threading.Thread(target=executar_post_twitter_cliente, args=(row, data, mlb_id)).start()
+        
+    # 3. Posta no Threads do cliente
+    if data.postar_threads and row['threads_access_token_enc']:
+        threading.Thread(target=executar_post_threads_cliente, args=(row, data)).start()
+        
+    return {"status": "success", "mlb_id": mlb_id, "msg": "Oferta publicada com sucesso no seu Discord e Redes!"}
+
+async def postar_discord_cliente(bot, canal_id: int, licenca_row, data, mlb_id: str):
+    channel = bot.get_channel(canal_id) or await bot.fetch_channel(canal_id)
+    if not channel:
+        print(f"⚠️ [SaaS] Canal {canal_id} não encontrado no Discord.")
+        return
+        
+    loja = data.loja or "Mercado Livre"
+    vendedor = data.vendedor or "Loja Oficial"
+    cor_embed = CORES_LOJAS.get(loja, 0x5865F2)
+    
+    linhas = []
+    if data.descricao_extra:
+        linhas.append(f"⚡ **{data.descricao_extra}**\n")
+        
+    if data.preco_de and data.preco_por:
+        linhas.append(f"❌ De: ~~{data.preco_de}~~\n💰 **Por: {data.preco_por}**")
+    elif data.preco_por:
+        linhas.append(f"💰 **Preço: {data.preco_por}**")
+        
+    if data.cupom:
+        linhas.append(f"\n🎟️ Use o cupom: `{data.cupom}`")
+        
+    if data.link:
+        linhas.append(f"\n🛒 **Link Seguro:** [Aproveitar Oferta]({data.link})")
+        
+    embed = discord.Embed(
+        title=data.titulo,
+        description="\n".join(linhas),
+        color=cor_embed,
+        timestamp=datetime.now()
+    )
+    
+    nome_exibicao = licenca_row['nome_usuario'] or "Bifes Promo"
+    embed.set_footer(text=f"Loja: {loja} • Vendedor: {vendedor} | {nome_exibicao}")
+    
+    img_path = f"imagens_temp/{mlb_id}.jpg"
+    view = LinkView(url=data.link) if data.link else None
+    
+    if os.path.exists(img_path):
+        file = discord.File(img_path, filename="oferta.jpg")
+        embed.set_image(url="attachment://oferta.jpg")
+        if view:
+            await channel.send(file=file, embed=embed, view=view)
+        else:
+            await channel.send(file=file, embed=embed)
+    else:
+        if data.imagem_url:
+            embed.set_image(url=data.imagem_url)
+        if view:
+            await channel.send(embed=embed, view=view)
+        else:
+            await channel.send(embed=embed)
+
+def executar_post_twitter_cliente(licenca_row, data, mlb_id: str):
+    try:
+        api_key = decriptar_dado(licenca_row['twitter_api_key_enc'])
+        api_secret = decriptar_dado(licenca_row['twitter_api_secret_enc'])
+        access_token = decriptar_dado(licenca_row['twitter_access_token_enc'])
+        access_secret = decriptar_dado(licenca_row['twitter_access_secret_enc'])
+        
+        if not all([api_key, api_secret, access_token, access_secret]):
+            return
+            
+        auth = tweepy.OAuth1UserHandler(api_key, api_secret, access_token, access_secret)
+        api_v1 = tweepy.API(auth)
+        client_v2 = tweepy.Client(consumer_key=api_key, consumer_secret=api_secret, access_token=access_token, access_token_secret=access_secret)
+        
+        txt = f"🔥 {data.titulo}\n\n"
+        if data.descricao_extra: txt += f"{data.descricao_extra}\n"
+        if data.preco_por: txt += f"💰 {data.preco_por}\n"
+        if data.cupom: txt += f"🎟️ Cupom: {data.cupom}\n"
+        txt += f"\n🛒 {data.link}"
+        
+        if len(txt) > 275: txt = txt[:270] + "..."
+        
+        media_id = None
+        img_path = f"imagens_temp/{mlb_id}.jpg"
+        if os.path.exists(img_path):
+            try: media_id = api_v1.media_upload(img_path).media_id
+            except: pass
+            
+        client_v2.create_tweet(text=txt, media_ids=[media_id] if media_id else None)
+        print(f"🐦 [Twitter Cliente] Tweet postado com sucesso para {licenca_row['chave_licenca']}")
+    except Exception as e:
+        print(f"⚠️ [Twitter Cliente] Erro ao postar: {e}")
+
+def executar_post_threads_cliente(licenca_row, data):
+    try:
+        user_id = decriptar_dado(licenca_row['threads_user_id_enc'])
+        access_token = decriptar_dado(licenca_row['threads_access_token_enc'])
+        
+        if not user_id or not access_token:
+            return
+            
+        txt = f"{data.titulo}\n\n"
+        if data.descricao_extra: txt += f"{data.descricao_extra}\n"
+        if data.preco_por: txt += f"💰 {data.preco_por}\n"
+        if data.cupom: txt += f"🎟️ Cupom: {data.cupom}\n"
+        txt += f"\nConfira: {data.link}"
+        
+        url = f"https://graph.threads.net/v1.0/{user_id}/threads"
+        res = requests.post(url, params={'media_type': 'TEXT', 'text': txt, 'access_token': access_token})
+        if res.status_code == 200:
+            requests.post(f"https://graph.threads.net/v1.0/{user_id}/threads_publish", 
+                          params={'creation_id': res.json()['id'], 'access_token': access_token})
+    except Exception as e:
+        print(f"⚠️ [Threads Cliente] Erro ao postar: {e}")
 
 class MainAPI(commands.Cog):
     def __init__(self, bot):
