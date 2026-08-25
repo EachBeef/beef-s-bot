@@ -1,0 +1,268 @@
+{
+    "FUT-16421055": {
+        "sport": "football",
+        "league": "La Liga",
+        "name": "Atlético Madrid vs Málaga CF",
+        "time": "2026-08-19T19:00:00Z",
+        "home": "Atlético Madrid",
+        "away": "Málaga CF",
+        "pools": {
+            "home": 34570,
+            "draw": 9898,
+            "away": 5531
+        },
+        "odds": {
+            "home": 1.33,
+            "draw": 4.65,
+            "away": 8.32
+        },
+        "status": "open"
+    },
+    "FUT-16253163": {
+        "sport": "football",
+        "league": "Copa Libertadores",
+        "name": "Independiente Rivadavia vs Fluminense",
+        "time": "2026-08-18T22:00:00Z",
+        "home": "Independiente Rivadavia",
+        "away": "Fluminense",
+        "pools": {
+            "home": 12419,
+            "draw": 13697,
+            "away": 23883
+        },
+        "odds": {
+            "home": 3.7,
+            "draw": 3.36,
+            "away": 1.93
+        },
+        "status": "open"
+    },
+    "FUT-16799741": {
+        "sport": "football",
+        "league": "Copa Libertadores",
+        "name": "Deportes Tolima vs Independiente del Valle",
+        "time": "2026-08-19T00:30:00Z",
+        "home": "Deportes Tolima",
+        "away": "Independiente del Valle",
+        "pools": {
+            "home": 21146,
+            "draw": 14538,
+            "away": 14314
+        },
+        "odds": {
+            "home": 2.18,
+            "draw": 3.16,
+            "away": 3.21
+        },
+        "status": "open"
+    },
+    "FUT-16253159": {
+        "sport": "football",
+        "league": "Copa Libertadores",
+        "name": "Universidad Católica vs Estudiantes de La Plata",
+        "time": "2026-08-19T00:30:00Z",
+        "home": "Universidad Católica",
+        "away": "Estudiantes de La Plata",
+        "pools": {
+            "home": 21060,
+            "draw": 14580,
+            "away": 14359
+        },
+        "odds": {
+            "home": 2.18,
+            "draw": 3.15,
+            "away": 3.2
+        },
+        "status": "open"
+    },
+    "FUT-16253171": {
+        "sport": "football",
+        "league": "Copa Libertadores",
+        "name": "Cerro Porteño vs Palmeiras",
+        "time": "2026-08-19T22:00:00Z",
+        "home": "Cerro Porteño",
+        "away": "Palmeiras",
+        "pools": {
+            "home": 10370,
+            "draw": 12962,
+            "away": 26666
+        },
+        "odds": {
+            "home": 4.44,
+            "draw": 3.55,
+            "away": 1.72
+        },
+        "status": "open"
+    },
+    "FUT-16253169": {
+        "sport": "football",
+        "league": "Copa Libertadores",
+        "name": "Coquimbo Unido vs Club Atlético Platense",
+        "time": "2026-08-19T22:00:00Z",
+        "home": "Coquimbo Unido",
+        "away": "Club Atlético Platense",
+        "pools": {
+            "home": 20873,
+            "draw": 14676,
+            "away": 14450
+        },
+        "odds": {
+            "home": 2.2,
+            "draw": 3.13,
+            "away": 3.18
+        },
+        "status": "open"
+    },
+    "FUT-16253167": {
+        "sport": "football",
+        "league": "Copa Libertadores",
+        "name": "Flamengo vs Cruzeiro",
+        "time": "2026-08-20T00:30:00Z",
+        "home": "Flamengo",
+        "away": "Cruzeiro",
+        "pools": {
+            "home": 29251,
+            "draw": 12558,
+            "away": 8190
+        },
+        "odds": {
+            "home": 1.57,
+            "draw": 3.66,
+            "away": 5.62
+        },
+        "status": "open"
+    },
+    "FUT-16707704": {
+        "sport": "football",
+        "league": "Champions League",
+        "name": "Fenerbahçe vs Olympique Lyonnais",
+        "time": "2026-08-18T19:00:00Z",
+        "home": "Fenerbahçe",
+        "away": "Olympique Lyonnais",
+        "pools": {
+            "home": 21247,
+            "draw": 12465,
+            "away": 16287
+        },
+        "odds": {
+            "home": 2.16,
+            "draw": 3.69,
+            "away": 2.82
+        },
+        "status": "open"
+    },
+    "FUT-16707702": {
+        "sport": "football",
+        "league": "Champions League",
+        "name": "GNK Dinamo Zagreb vs Viking FK",
+        "time": "2026-08-18T19:00:00Z",
+        "home": "GNK Dinamo Zagreb",
+        "away": "Viking FK",
+        "pools": {
+            "home": 33109,
+            "draw": 9758,
+            "away": 7131
+        },
+        "odds": {
+            "home": 1.39,
+            "draw": 4.71,
+            "away": 6.45
+        },
+        "status": "open"
+    },
+    "FUT-16707695": {
+        "sport": "football",
+        "league": "Champions League",
+        "name": "Levski Sofia vs AEK Athens",
+        "time": "2026-08-18T19:00:00Z",
+        "home": "Levski Sofia",
+        "away": "AEK Athens",
+        "pools": {
+            "home": 13106,
+            "draw": 13877,
+            "away": 23016
+        },
+        "odds": {
+            "home": 3.51,
+            "draw": 3.31,
+            "away": 2.0
+        },
+        "status": "open"
+    },
+    "FUT-16707698": {
+        "sport": "football",
+        "league": "Champions League",
+        "name": "Celtic vs LASK",
+        "time": "2026-08-19T19:00:00Z",
+        "home": "Celtic",
+        "away": "LASK",
+        "pools": {
+            "home": 32322,
+            "draw": 9866,
+            "away": 7811
+        },
+        "odds": {
+            "home": 1.42,
+            "draw": 4.66,
+            "away": 5.89
+        },
+        "status": "open"
+    },
+    "FUT-16707697": {
+        "sport": "football",
+        "league": "Champions League",
+        "name": "NEC Nijmegen vs Bodø/Glimt",
+        "time": "2026-08-19T19:00:00Z",
+        "home": "NEC Nijmegen",
+        "away": "Bodø/Glimt",
+        "pools": {
+            "home": 20588,
+            "draw": 12867,
+            "away": 16544
+        },
+        "odds": {
+            "home": 2.23,
+            "draw": 3.57,
+            "away": 2.78
+        },
+        "status": "open"
+    },
+    "FUT-16707699": {
+        "sport": "football",
+        "league": "Champions League",
+        "name": "ŠK Slovan Bratislava vs NK Celje",
+        "time": "2026-08-19T19:00:00Z",
+        "home": "ŠK Slovan Bratislava",
+        "away": "NK Celje",
+        "pools": {
+            "home": 28993,
+            "draw": 11670,
+            "away": 9336
+        },
+        "odds": {
+            "home": 1.59,
+            "draw": 3.94,
+            "away": 4.93
+        },
+        "status": "open"
+    },
+    "FUT-16707694": {
+        "sport": "football",
+        "league": "Champions League",
+        "name": "Hapoel Be'er Sheva vs Sabah FK",
+        "time": "2026-08-19T19:00:00Z",
+        "home": "Hapoel Be'er Sheva",
+        "away": "Sabah FK",
+        "pools": {
+            "home": 27978,
+            "draw": 12011,
+            "away": 10009
+        },
+        "odds": {
+            "home": 1.64,
+            "draw": 3.83,
+            "away": 4.6
+        },
+        "status": "open"
+    }
+}

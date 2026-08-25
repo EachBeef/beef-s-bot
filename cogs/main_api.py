@@ -1,0 +1,1105 @@
+import discord
+from discord.ext import commands
+from fastapi import FastAPI, HTTPException, Request, Header, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import sqlite3
+import uvicorn
+import asyncio
+import os
+import secrets
+import threading
+import httpx
+import tweepy
+import requests 
+import random 
+import json
+import math
+import time
+import mercadopago
+from datetime import datetime
+from dotenv import load_dotenv
+from typing import Optional, Dict, List
+
+# --- CONFIGURAÇÕES ---
+load_dotenv()
+
+PORTA = 28052
+SENHA_ADMIN = "EachBeef241"
+TOKEN_ADMIN = secrets.token_hex(16)
+
+# Bancos de Dados
+DB_BIFINHOS = "bifinhos.db"
+DB_PROMO = "bifes_links.db"
+COOLDOWN_SECONDS = 8 * 60 * 60  # 8 horas
+
+# Chaves API (Do seu .env)
+TT_API_KEY = os.getenv('TT_API_KEY')
+TT_API_SECRET = os.getenv('TT_API_SECRET')
+TT_ACCESS_TOKEN = os.getenv('TT_ACCESS_TOKEN')
+TT_ACCESS_SECRET = os.getenv('TT_ACCESS_SECRET')
+THREADS_USER_ID = os.getenv('THREADS_USER_ID')
+THREADS_ACCESS_TOKEN = os.getenv('THREADS_ACCESS_TOKEN')
+ML_CHANNEL_ID = os.getenv('ML_CHANNEL_ID')
+DISCORD_CLIENT_ID = os.getenv("DISCORD_CLIENT_ID", "921518902138269746")
+DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET") 
+
+# SDK do Mercado Pago
+mp_sdk = mercadopago.SDK(os.getenv("MP_ACCESS_TOKEN"))
+
+# --- INICIALIZAÇÃO DO FASTAPI ---
+app = FastAPI(title="Bifes Super API", version="4.6") # Versão Final (Guildas + Palavras Limpas)
+
+# Configuração CORS ampla (permite qualquer origem http/https para evitar bloqueios no frontend)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origin_regex=r"^https?:\/\/.*",
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.get("/")
+def root_status():
+    bot = getattr(app.state, "bot_instance", None)
+    return {
+        "status": "online",
+        "api": "Bifes Super API",
+        "version": "4.6",
+        "bot_ready": bot.is_ready() if bot else False
+    }
+
+# --- FUNÇÕES DE BANCO DE DADOS ---
+
+def get_db_bifinhos():
+    conn = sqlite3.connect(DB_BIFINHOS, timeout=10)
+    conn.execute('PRAGMA journal_mode=WAL;') 
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def get_db_promo():
+    conn = sqlite3.connect(DB_PROMO, timeout=10)
+    conn.execute('PRAGMA journal_mode=WAL;') 
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_dbs():
+    with get_db_bifinhos() as conn:
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS bifinhos (
+                user_id TEXT PRIMARY KEY, 
+                balance INTEGER NOT NULL, 
+                last_claim INTEGER NOT NULL
+            )
+        ''')
+        # Atualizações seguras (não apaga os dados de quem já tem bifinhos)
+        try:
+            conn.execute("ALTER TABLE bifinhos ADD COLUMN tier_vip INTEGER DEFAULT 0")
+            conn.execute("ALTER TABLE bifinhos ADD COLUMN expira_em INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass # As colunas já existem
+
+        try:
+            conn.execute("ALTER TABLE bifinhos ADD COLUMN lembrete_ativo INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+            
+        try:
+            conn.execute("ALTER TABLE bifinhos ADD COLUMN aviso_8h INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+            
+        try:
+            conn.execute("ALTER TABLE bifinhos ADD COLUMN aviso_20h INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS partidas_xadrez (
+                sala_id TEXT PRIMARY KEY,
+                jogador1_id TEXT,
+                senha1 TEXT,
+                jogador2_id TEXT,
+                senha2 TEXT,
+                valor INTEGER,
+                status TEXT,
+                vencedor_id TEXT,
+                fen TEXT DEFAULT 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1'
+            )
+        ''')
+        
+        # Migração automática para renomear a coluna se ela ainda existir com o nome antigo
+        try:
+            conn.execute("ALTER TABLE partidas_xadrez RENAME COLUMN aposta TO valor")
+        except sqlite3.OperationalError:
+            pass
+            
+        try:
+            conn.execute("ALTER TABLE partidas_xadrez ADD COLUMN fen TEXT DEFAULT 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1'")
+        except sqlite3.OperationalError:
+            pass
+
+        # Nova Tabela para Boost de Servidores
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS servidores_boost (
+                guild_id TEXT PRIMARY KEY,
+                booster_user_id TEXT,
+                multiplicador REAL,
+                expira_em INTEGER
+            )
+        ''')
+
+        # Nova Tabela para Relatório Mensal (Competição)
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS historico_mensal (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                mes_ano TEXT NOT NULL,
+                quantidade INTEGER NOT NULL,
+                tipo_ganho TEXT NOT NULL,
+                data_timestamp INTEGER NOT NULL
+            )
+        ''')
+        
+        # --- TABELA NOVA: GUILDAS ---
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS guildas (
+                owner_id TEXT PRIMARY KEY,
+                text_channel_id TEXT,
+                voice_channel_id TEXT
+            )
+        ''')
+
+init_dbs()
+
+# --- FUNÇÃO AUXILIAR PARA REGISTRAR GANHOS ---
+def registrar_ganho_mensal(user_id: str, quantidade: int, tipo_ganho: str):
+    now = datetime.now()
+    mes_ano = now.strftime("%m/%Y") # Ex: "03/2026"
+    timestamp = int(now.timestamp())
+    
+    conn = get_db_bifinhos()
+    conn.execute('''
+        INSERT INTO historico_mensal (user_id, mes_ano, quantidade, tipo_ganho, data_timestamp)
+        VALUES (?, ?, ?, ?, ?)
+    ''', (user_id, mes_ano, quantidade, tipo_ganho, timestamp))
+    conn.commit()
+    conn.close()
+
+
+# --- MODELOS DE DADOS ---
+class ClaimRequest(BaseModel):
+    userId: str
+    username: str 
+
+class LoginRequest(BaseModel):
+    senha: str
+
+class AprovarRequest(BaseModel):
+    mlb_id: str
+    novo_link: str
+    descricao_extra: Optional[str] = ""
+    novo_titulo: Optional[str] = ""
+    nova_descricao: Optional[str] = ""
+    cupom: Optional[str] = ""
+    preco_de: Optional[str] = ""
+    preco_por: Optional[str] = ""
+    postar_discord: bool = True
+    postar_twitter: bool = False
+    postar_threads: bool = False
+
+class PostarDiretoRequest(BaseModel):
+    titulo: str
+    link: str
+    preco_de: Optional[str] = ""
+    preco_por: Optional[str] = ""
+    descricao_extra: Optional[str] = ""
+    cupom: Optional[str] = ""
+    loja: Optional[str] = "Mercado Livre"
+    vendedor: Optional[str] = ""
+    imagem_url: Optional[str] = ""
+    postar_discord: bool = True
+    postar_twitter: bool = False
+    postar_threads: bool = False
+
+class CapturarRequest(BaseModel):
+    titulo: str
+    link_original: str
+    link_afiliado: Optional[str] = ""
+    preco_de: Optional[str] = ""
+    preco_por: Optional[str] = ""
+    descricao_extra: Optional[str] = ""
+    cupom: Optional[str] = ""
+    loja: Optional[str] = "Mercado Livre"
+    vendedor: Optional[str] = ""
+    imagem_url: Optional[str] = ""
+
+class XadrezLoginRequest(BaseModel):
+    sala_id: str
+    senha: str
+
+class XadrezTerminarRequest(BaseModel):
+    sala_id: str
+    senha: str  
+    vencedor_id: str  
+    motivo: Optional[str] = "xeque-mate" 
+
+class PagamentoRequest(BaseModel):
+    discord_id: str
+    item_id: str
+    titulo: str
+    preco: float
+
+class ToggleLembreteRequest(BaseModel):
+    user_id: str
+    ativo: int
+
+# ==========================================
+#  ROTAS: MERCADO PAGO E SISTEMA VIP
+# ==========================================
+
+@app.post("/api/pagamento/gerar")
+def gerar_pagamento(data: PagamentoRequest):
+    preference_data = {
+        "items": [
+            {
+                "id": data.item_id,
+                "title": f"Bifes Bot - {data.titulo}",
+                "quantity": 1,
+                "currency_id": "BRL",
+                "unit_price": data.preco
+            }
+        ],
+        "external_reference": data.discord_id,
+        "notification_url": "https://api.bifes.com.br/api/pagamento/webhook",
+        "back_urls": {
+            "success": "https://bifes.com.br/loja",
+            "failure": "https://bifes.com.br/loja",
+            "pending": "https://bifes.com.br/loja"
+        },
+        "auto_return": "approved"
+    }
+
+    preference_response = mp_sdk.preference().create(preference_data)
+    return {"link_pagamento": preference_response["response"]["init_point"]}
+
+
+@app.post("/api/pagamento/webhook")
+async def webhook_mercadopago(request: Request):
+    data = await request.json()
+    
+    if data.get("type") == "payment" or data.get("action") == "payment.created":
+        try:
+            payment_id = data.get("data", {}).get("id")
+            payment_info = mp_sdk.payment().get(payment_id)
+            payment = payment_info["response"]
+            
+            if payment.get("status") == "approved":
+                discord_id = payment.get("external_reference")
+                itens = payment.get("additional_info", {}).get("items", [])
+                
+                if discord_id and itens:
+                    item_comprado = itens[0].get("id")
+                    
+                    bot = app.state.bot_instance
+                    if bot:
+                        asyncio.run_coroutine_threadsafe(
+                            processar_entrega_vip(bot, discord_id, item_comprado),
+                            bot.loop
+                        )
+        except Exception as e:
+            print(f"Erro no Webhook: {e}")
+
+    return {"status": "ok"}
+
+
+async def processar_entrega_vip(bot, discord_id: str, item_id: str):
+    # !!! ATENÇÃO: COLOQUE SEU GUILD_ID REAL AQUI !!!
+    GUILD_ID = 123456789012345678 # ID do seu servidor oficial
+    
+    CARGOS = {
+        "vip_1": 1478010799183368202,
+        "vip_2": 1478011479457402982,
+        "vip_3": 1478011439397736498,
+        "donate_1": 44444444444444444,
+        "donate_2": 44444444444444444,
+        "donate_3": 44444444444444444,
+        "donate_4": 44444444444444444,
+        "donate_5": 44444444444444444,
+        "donate_6": 44444444444444444 
+    }
+    
+    TIERS = {"vip_1": 1, "vip_2": 2, "vip_3": 3}
+    BIFINHOS_POR_DOACAO = {
+        "donate_1": 25000,
+        "donate_2": 90000,
+        "donate_3": 300000,
+        "donate_4": 850000,
+        "donate_5": 1900000,
+        "donate_6": 4000000
+    }
+    
+    try:
+        guild = bot.get_guild(GUILD_ID)
+        member = guild.get_member(int(discord_id)) or await guild.fetch_member(int(discord_id)) if guild else None
+        
+        if item_id in TIERS:
+            tier = TIERS[item_id]
+            expira_em = int(time.time()) + (30 * 24 * 60 * 60)
+            
+            conn = get_db_bifinhos()
+            conn.execute('''
+                INSERT INTO bifinhos (user_id, balance, last_claim, tier_vip, expira_em) 
+                VALUES (?, 0, 0, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET 
+                tier_vip=excluded.tier_vip, expira_em=excluded.expira_em
+            ''', (discord_id, tier, expira_em))
+            conn.commit()
+            conn.close()
+            
+            if member and item_id in CARGOS:
+                cargo = guild.get_role(CARGOS[item_id])
+                if cargo: await member.add_roles(cargo)
+                
+                embed = discord.Embed(title="💎 Título Nobre Ativado!", description="Seu plano VIP foi ativado com sucesso! Aproveite seus multiplicadores.", color=0x2ecc71)
+                await member.send(embed=embed)
+                
+                if item_id == "vip_3":
+                    try:
+                        from cogs.guildas import GuildaPanel
+                        conn = get_db_bifinhos()
+                        guilda_existe = conn.execute("SELECT * FROM guildas WHERE owner_id = ?", (str(member.id),)).fetchone()
+                        
+                        if not guilda_existe:
+                            categoria = discord.utils.get(guild.categories, name="👑 GUILDAS")
+                            if not categoria:
+                                categoria = await guild.create_category("👑 GUILDAS")
+
+                            overwrites = {
+                                guild.default_role: discord.PermissionOverwrite(read_messages=False, connect=False),
+                                member: discord.PermissionOverwrite(read_messages=True, send_messages=True, connect=True, move_members=True)
+                            }
+
+                            txt_channel = await categoria.create_text_channel(f"💬・guilda-do-{member.name.lower()}", overwrites=overwrites)
+                            voc_channel = await categoria.create_voice_channel(f"🔊・Call do {member.display_name}", overwrites=overwrites, user_limit=20)
+
+                            conn.execute("INSERT INTO guildas (owner_id, text_channel_id, voice_channel_id) VALUES (?, ?, ?)", 
+                                         (str(member.id), str(txt_channel.id), str(voc_channel.id)))
+                            conn.commit()
+
+                            embed_painel = discord.Embed(
+                                title="👑 Painel do Imperador",
+                                description="Esta é a sua Base de Operações!\n\nUse os botões abaixo para gerenciar seus amigos, escolher quem entra, e como sua sala de voz vai se chamar.",
+                                color=0xffd700
+                            )
+                            embed_painel.set_footer(text="Sua Guilda tem um limite de 20 vagas na sala de voz.")
+                            
+                            msg = await txt_channel.send(content=member.mention, embed=embed_painel, view=GuildaPanel())
+                            await msg.pin()
+                        conn.close()
+                    except Exception as eg:
+                        print(f"Erro ao criar guilda para {discord_id}: {eg}")
+
+        elif item_id.startswith("donate_"):
+            if member:
+                cargo = guild.get_role(CARGOS.get(item_id))
+                if cargo: await member.add_roles(cargo)
+                
+                embed = discord.Embed(title="🥩 Doação Recebida!", description="Muito obrigado pelo seu apoio! Seu cargo exclusivo já foi entregue.", color=0xff9900)
+                await member.send(embed=embed)
+            
+            if item_id in BIFINHOS_POR_DOACAO:
+                qtd_bifinhos = BIFINHOS_POR_DOACAO[item_id]
+                conn = get_db_bifinhos()
+                conn.execute('''
+                    INSERT INTO bifinhos (user_id, balance, last_claim) 
+                    VALUES (?, ?, 0)
+                    ON CONFLICT(user_id) DO UPDATE SET 
+                    balance = balance + ?
+                ''', (discord_id, qtd_bifinhos, qtd_bifinhos))
+                conn.commit()
+                conn.close()
+                registrar_ganho_mensal(discord_id, qtd_bifinhos, "comprado")
+            
+    except Exception as e:
+        print(f"Erro ao entregar recompensa Discord: {e}")
+
+# ==========================================
+#  LÓGICA MATEMÁTICA DOS BIFINHOS
+# ==========================================
+
+def calcular_multiplicador(tier_vip: int, max_server_boost: float):
+    multiplicador_pessoal = 1.0
+    if tier_vip == 1: multiplicador_pessoal = 1.5
+    elif tier_vip == 2: multiplicador_pessoal = 2.0
+    elif tier_vip == 3: multiplicador_pessoal = 3.0
+
+    if tier_vip == 0:
+        return max_server_boost
+    else:
+        bonus_extra_servidor = max_server_boost - 1.0
+        return multiplicador_pessoal + (bonus_extra_servidor / 2.0)
+
+# ==========================================
+#  ROTAS: BIFINHOS E LEMBRETES
+# ==========================================
+
+@app.post("/claim")
+def claim_bifinhos(data: ClaimRequest):
+    conn = get_db_bifinhos()
+    c = conn.cursor()
+    c.execute("SELECT balance, last_claim, tier_vip, expira_em FROM bifinhos WHERE user_id = ?", (data.userId,))
+    row = c.fetchone()
+    
+    current_balance = row['balance'] if row else 0
+    last_claim_ts = row['last_claim'] if row else 0
+    tier_vip = row['tier_vip'] if row and 'tier_vip' in row.keys() else 0
+    expira_em = row['expira_em'] if row and 'expira_em' in row.keys() else 0
+    
+    now = datetime.now()
+    now_ts = int(now.timestamp())
+    
+    if expira_em > 0 and now_ts > expira_em:
+        tier_vip = 0
+        expira_em = 0
+        c.execute("UPDATE bifinhos SET tier_vip = 0, expira_em = 0 WHERE user_id = ?", (data.userId,))
+        conn.commit()
+
+    cd_atual = COOLDOWN_SECONDS
+
+    if last_claim_ts > 0:
+        last_claim_date = datetime.fromtimestamp(last_claim_ts)
+        diff = (now - last_claim_date).total_seconds()
+        
+        if diff < (cd_atual - 2):
+            conn.close()
+            return {
+                "status": "error", 
+                "error": "Cooldown", 
+                "message": "⏳ Você ainda precisa esperar!", 
+                "seconds_left": cd_atual - diff
+            }
+
+    max_server_boost = 1.0
+    booster_id = None 
+    
+    bot = app.state.bot_instance
+    if bot:
+        boosts = c.execute("SELECT guild_id, multiplicador, booster_user_id FROM servidores_boost WHERE expira_em > ?", (now_ts,)).fetchall()
+        for b in boosts:
+            guild = bot.get_guild(int(b['guild_id']))
+            if guild and guild.get_member(int(data.userId)):
+                if b['multiplicador'] > max_server_boost:
+                    max_server_boost = b['multiplicador']
+                    booster_id = b['booster_user_id'] 
+
+    multiplicador_final = calcular_multiplicador(tier_vip, max_server_boost)
+    recompensa_base = random.randint(250, 1000)
+    
+    msg_extra = ""
+    is_raro = False
+    if random.random() < 0.05:
+        recompensa_base += 500
+        is_raro = True
+        msg_extra = "🎉 BÔNUS MÁXIMO! Recompensa Rara de +500 bifinhos base!"
+
+    reward = math.floor(recompensa_base * multiplicador_final)
+    new_balance = current_balance + reward
+    
+    c.execute('''
+        INSERT INTO bifinhos (user_id, balance, last_claim, tier_vip, expira_em, aviso_8h) 
+        VALUES (?, ?, ?, ?, ?, 0)
+        ON CONFLICT(user_id) DO UPDATE SET 
+        balance=excluded.balance, last_claim=excluded.last_claim, aviso_8h=0
+    ''', (data.userId, new_balance, now_ts, tier_vip, expira_em))
+    conn.commit()
+    conn.close() 
+
+    registrar_ganho_mensal(data.userId, reward, "diario")
+    
+    conn = get_db_bifinhos()
+    c = conn.cursor()
+    c.execute("SELECT user_id FROM bifinhos ORDER BY balance DESC")
+    rows = c.fetchall()
+    rank = next((i + 1 for i, r in enumerate(rows) if r['user_id'] == data.userId), None)
+    conn.close()
+
+    if max_server_boost > 1.0 and tier_vip == 0:
+        msg_extra += f" 🚀 Você ganhou um bônus de {max_server_boost}x por estar em um servidor upado!"
+
+    return {
+        "status": "success",
+        "reward": reward,
+        "new_balance": new_balance,
+        "rank": rank,
+        "message_extra": msg_extra.strip(),
+        "details": {
+            "base": recompensa_base,
+            "is_raro": is_raro,
+            "tier_vip": tier_vip,
+            "server_boost": max_server_boost,
+            "booster_id": booster_id,
+            "multiplicador_final": multiplicador_final
+        }
+    }
+
+
+@app.get("/balance/{user_id}")
+def get_balance(user_id: str):
+    conn = get_db_bifinhos()
+    row = conn.execute("SELECT balance, last_claim FROM bifinhos WHERE user_id = ?", (user_id,)).fetchone()
+    
+    rows = conn.execute("SELECT user_id FROM bifinhos ORDER BY balance DESC").fetchall()
+    rank = next((i + 1 for i, r in enumerate(rows) if r['user_id'] == user_id), None)
+    conn.close()
+    
+    bal = row['balance'] if row else 0
+    lc = row['last_claim'] if row else 0
+    return {"balance": bal, "last_claim": lc, "rank": rank}
+
+
+@app.get("/api/lembrete/{user_id}")
+def get_lembrete_status(user_id: str):
+    conn = get_db_bifinhos()
+    try:
+        row = conn.execute("SELECT lembrete_ativo FROM bifinhos WHERE user_id = ?", (user_id,)).fetchone()
+        status = row['lembrete_ativo'] if row and 'lembrete_ativo' in row.keys() else 0
+    except Exception as e:
+        print(f"Erro ao buscar status do lembrete: {e}")
+        status = 0
+    finally:
+        conn.close()
+        
+    return {"lembrete_ativo": status}
+
+@app.post("/api/lembrete/toggle")
+def toggle_lembrete(data: ToggleLembreteRequest):
+    conn = get_db_bifinhos()
+    c = conn.cursor()
+    
+    c.execute("SELECT balance FROM bifinhos WHERE user_id = ?", (data.user_id,))
+    if not c.fetchone():
+        c.execute("INSERT INTO bifinhos (user_id, balance, last_claim, lembrete_ativo) VALUES (?, 0, 0, ?)", (data.user_id, data.ativo))
+    else:
+        c.execute("UPDATE bifinhos SET lembrete_ativo = ? WHERE user_id = ?", (data.ativo, data.user_id))
+        
+    conn.commit()
+    conn.close()
+    return {"status": "success", "lembrete_ativo": data.ativo}
+
+@app.post("/auth/discord/callback")
+async def discord_auth(request: Request):
+    data = await request.json()
+    code = data.get("code")
+    if not code: raise HTTPException(400, "Código faltando")
+    
+    if not DISCORD_CLIENT_SECRET:
+        print("❌ ERRO CRÍTICO: Adicione DISCORD_CLIENT_SECRET no .env")
+        raise HTTPException(500, "Erro interno de configuração")
+
+    REDIRECT_URI = "https://www.bifes.com.br/bifinhos"
+
+    async with httpx.AsyncClient() as client:
+        payload = {
+            "client_id": DISCORD_CLIENT_ID,
+            "client_secret": DISCORD_CLIENT_SECRET,
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": REDIRECT_URI,
+            "scope": "identify guilds guilds.join email"
+        }
+        
+        try:
+            token_res = await client.post("https://discord.com/api/oauth2/token", data=payload, headers={"Content-Type": "application/x-www-form-urlencoded"})
+            
+            if token_res.status_code != 200:
+                print(f"Erro Token Discord: {token_res.text}")
+                raise HTTPException(400, "Falha na autenticação com Discord")
+                
+            access_token = token_res.json().get("access_token")
+            user_res = await client.get("https://discord.com/api/users/@me", headers={"Authorization": f"Bearer {access_token}"})
+            
+            if user_res.status_code != 200:
+                raise HTTPException(400, "Falha ao pegar dados do usuário")
+                
+            return {"user": user_res.json()}
+            
+        except Exception as e:
+            print(f"Exceção Auth: {e}")
+            raise HTTPException(500, "Erro interno na autenticação")
+
+
+# ==========================================
+#  ROTAS: XADREZ VIP (Site) & WEBSOCKETS
+# ==========================================
+
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: Dict[str, List[WebSocket]] = {}
+
+    async def connect(self, websocket: WebSocket, sala_id: str):
+        await websocket.accept()
+        if sala_id not in self.active_connections:
+            self.active_connections[sala_id] = []
+        self.active_connections[sala_id].append(websocket)
+
+    def disconnect(self, websocket: WebSocket, sala_id: str):
+        if sala_id in self.active_connections:
+            self.active_connections[sala_id].remove(websocket)
+            if not self.active_connections[sala_id]:
+                del self.active_connections[sala_id]
+
+    async def broadcast_to_room(self, sala_id: str, message: dict):
+        if sala_id in self.active_connections:
+            for connection in self.active_connections[sala_id]:
+                await connection.send_text(json.dumps(message))
+
+manager = ConnectionManager()
+
+@app.websocket("/ws/xadrez/{sala_id}")
+async def websocket_xadrez(websocket: WebSocket, sala_id: str):
+    await manager.connect(websocket, sala_id)
+    try:
+        while True:
+            data = await websocket.receive_text()
+            jogada = json.loads(data)
+            
+            if "fen" in jogada:
+                conn = get_db_bifinhos()
+                conn.execute("UPDATE partidas_xadrez SET fen = ? WHERE sala_id = ?", (jogada["fen"], sala_id))
+                conn.commit()
+                conn.close()
+            
+            await manager.broadcast_to_room(sala_id, jogada)
+            
+    except WebSocketDisconnect:
+        manager.disconnect(websocket, sala_id)
+
+
+@app.post("/api/xadrez/login")
+def xadrez_login(data: XadrezLoginRequest):
+    conn = get_db_bifinhos()
+    row = conn.execute("SELECT * FROM partidas_xadrez WHERE sala_id = ?", (data.sala_id,)).fetchone()
+    conn.close()
+
+    if not row:
+        raise HTTPException(404, "Sala não encontrada.")
+
+    if row['status'] != 'pendente':
+        raise HTTPException(400, f"Esta partida já foi encerrada ou expirou (Status: {row['status']}).")
+
+    fen_atual = row['fen'] if 'fen' in row.keys() else 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1'
+
+    if data.senha == row['senha1']:
+        return {
+            "status": "success", "cor": "brancas", "jogador_id": row['jogador1_id'], 
+            "oponente_id": row['jogador2_id'], "valor": row['valor'], "fen": fen_atual
+        }
+    elif data.senha == row['senha2']:
+        return {
+            "status": "success", "cor": "pretas", "jogador_id": row['jogador2_id'], 
+            "oponente_id": row['jogador1_id'], "valor": row['valor'], "fen": fen_atual
+        }
+    else:
+        raise HTTPException(401, "Senha de 6 dígitos incorreta.")
+
+@app.post("/api/xadrez/terminar")
+def xadrez_terminar(data: XadrezTerminarRequest):
+    conn = get_db_bifinhos()
+    c = conn.cursor()
+    c.execute("SELECT * FROM partidas_xadrez WHERE sala_id = ?", (data.sala_id,))
+    row = c.fetchone()
+
+    if not row:
+        conn.close()
+        raise HTTPException(404, "Sala não encontrada.")
+
+    if row['status'] != 'pendente':
+        conn.close()
+        raise HTTPException(400, "A partida já foi finalizada pelo outro jogador.")
+
+    if data.senha != row['senha1'] and data.senha != row['senha2']:
+        conn.close()
+        raise HTTPException(401, "Não autorizado. Falha de segurança na senha.")
+
+    c.execute("UPDATE partidas_xadrez SET status = 'finalizada', vencedor_id = ? WHERE sala_id = ?", (data.vencedor_id, data.sala_id))
+    
+    valor_individual = row['valor']
+    jogador1 = row['jogador1_id']
+    jogador2 = row['jogador2_id']
+    anuncio_msg = ""
+    
+    if data.vencedor_id == 'empate':
+        c.execute("UPDATE bifinhos SET balance = balance + ? WHERE user_id = ?", (valor_individual, jogador1))
+        c.execute("UPDATE bifinhos SET balance = balance + ? WHERE user_id = ?", (valor_individual, jogador2))
+        anuncio_msg = f"🤝 O Desafio de Estratégia entre <@{jogador1}> e <@{jogador2}> terminou em **Empate**! Os {valor_individual} 🥩 de cada um foram devolvidos."
+    else:
+        pote_total = valor_individual * 2
+        perdedor = jogador2 if data.vencedor_id == jogador1 else jogador1
+        c.execute("UPDATE bifinhos SET balance = balance + ? WHERE user_id = ?", (pote_total, data.vencedor_id))
+        
+        conn.commit()
+        conn.close()
+        registrar_ganho_mensal(data.vencedor_id, valor_individual, "xadrez")
+        
+        if data.motivo == 'tempo':
+            anuncio_msg = f"⏳ **VITÓRIA POR ABANDONO!** O jogador <@{perdedor}> demorou demais ou fugiu da partida! <@{data.vencedor_id}> venceu por tempo e levou o bônus de **{pote_total} Bifinhos**! 🥩"
+        else:
+            anuncio_msg = f"🏆 **XEQUE-MATE!** O jogador <@{data.vencedor_id}> humilhou <@{perdedor}> no Desafio de Estratégia e levou o bônus de **{pote_total} Bifinhos**! 🥩"
+
+    if 'conn' in locals() and conn:
+        try: conn.close()
+        except: pass
+
+    bot = app.state.bot_instance
+    if bot:
+        canal_xadrez_id = 123456789012345678 
+        channel = bot.get_channel(canal_xadrez_id)
+        if channel:
+            asyncio.run_coroutine_threadsafe(channel.send(anuncio_msg), bot.loop)
+
+    return {"status": "success", "message": "Partida encerrada com sucesso! Pontos na conta."}
+
+# ==========================================
+#  ROTAS: PROMOÇÕES (Admin)
+# ==========================================
+
+@app.post("/api/admin/login")
+def admin_login(data: LoginRequest):
+    if data.senha == SENHA_ADMIN:
+        return {"token": TOKEN_ADMIN, "msg": "Sucesso"}
+    raise HTTPException(401, "Senha incorreta")
+
+@app.get("/api/admin/pendencias")
+def get_pendencias(authorization: str = Header(None)):
+    if authorization != TOKEN_ADMIN: raise HTTPException(401, "Não autorizado")
+    
+    conn = get_db_promo()
+    try:
+        rows = conn.execute('''
+            SELECT mlb_id, nome, meu_link, ultima_notificacao, vendedor, url_original, titulo_ia, descricao_oferta, loja_origem 
+            FROM produtos ORDER BY ultima_notificacao DESC LIMIT 30
+        ''').fetchall()
+    except Exception as e:
+        conn.close()
+        raise HTTPException(500, f"Erro DB Promo: {str(e)}")
+        
+    conn.close()
+    
+    lista = []
+    for row in rows:
+        link_final = row['url_original'] if row['url_original'] else f"https://mercadolivre.com.br/p/{row['mlb_id']}"
+        lista.append({
+            "mlb_id": row['mlb_id'],
+            "nome": row['nome'],
+            "meu_link": row['meu_link'],
+            "link_original": link_final,
+            "ultima_notificacao": row['ultima_notificacao'],
+            "vendedor": row['vendedor'] or "Desconhecido",
+            "titulo_ia": row['titulo_ia'],
+            "descricao": row['descricao_oferta'],
+            "loja": row['loja_origem'] or "Mercado Livre"
+        })
+    return lista
+
+def baixar_imagem_url(url: str, mlb_id: str):
+    if not url: return None
+    try:
+        if not os.path.exists("imagens_temp"):
+            os.makedirs("imagens_temp")
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
+        res = requests.get(url, headers=headers, timeout=10)
+        if res.status_code == 200:
+            caminho = f"imagens_temp/{mlb_id}.jpg"
+            with open(caminho, "wb") as f:
+                f.write(res.content)
+            return caminho
+    except Exception as e:
+        print(f"Erro ao baixar imagem da URL ({url}): {e}")
+    return None
+
+@app.get("/api/admin/imagem/{mlb_id}")
+def get_imagem_promo(mlb_id: str):
+    caminho = f"imagens_temp/{mlb_id}.jpg"
+    if os.path.exists(caminho):
+        return FileResponse(caminho, media_type="image/jpeg")
+    raise HTTPException(404, "Imagem não encontrada")
+
+@app.post("/api/admin/postar_direto")
+def postar_direto(data: PostarDiretoRequest, authorization: str = Header(None)):
+    if authorization != TOKEN_ADMIN and authorization != SENHA_ADMIN:
+        raise HTTPException(401, "Não autorizado")
+    
+    mlb_id = f"ext_{int(time.time())}_{random.randint(100, 999)}"
+    
+    # Baixa imagem se fornecida
+    if data.imagem_url:
+        baixar_imagem_url(data.imagem_url, mlb_id)
+        
+    # Salva no banco de dados
+    conn = get_db_promo()
+    try:
+        descricao_completa = data.preco_por or ""
+        if data.preco_de and data.preco_por:
+            descricao_completa = f"De: {data.preco_de} Por: {data.preco_por}"
+        if data.cupom:
+            descricao_completa += f" (Cupom: {data.cupom})"
+            
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        conn.execute('''
+            INSERT INTO produtos (mlb_id, nome, meu_link, ultima_notificacao, vendedor, url_original, loja_origem, descricao_oferta, titulo_ia)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(mlb_id) DO UPDATE SET meu_link=excluded.meu_link, titulo_ia=excluded.titulo_ia
+        ''', (mlb_id, data.titulo, data.link, now_str, data.vendedor or "Loja Oficial", data.link, data.loja or "Mercado Livre", descricao_completa, data.titulo))
+        conn.commit()
+    except Exception as e:
+        print(f"Erro ao salvar no banco: {e}")
+    finally:
+        conn.close()
+
+    bot = app.state.bot_instance
+    if bot:
+        row_dict = {
+            "mlb_id": mlb_id,
+            "vendedor": data.vendedor or "Loja Oficial",
+            "loja_origem": data.loja or "Mercado Livre"
+        }
+        if data.postar_discord:
+            asyncio.run_coroutine_threadsafe(postar_discord(bot, row_dict, data), bot.loop)
+        if data.postar_twitter:
+            threading.Thread(target=executar_post_twitter, args=(data,)).start()
+        if data.postar_threads:
+            threading.Thread(target=executar_post_threads, args=(data,)).start()
+
+    return {"status": "success", "mlb_id": mlb_id, "msg": "Oferta postada com sucesso!"}
+
+@app.post("/api/admin/capturar")
+def capturar_oferta(data: CapturarRequest, authorization: str = Header(None)):
+    if authorization != TOKEN_ADMIN and authorization != SENHA_ADMIN:
+        raise HTTPException(401, "Não autorizado")
+        
+    mlb_id = f"ext_{int(time.time())}_{random.randint(100, 999)}"
+    
+    if data.imagem_url:
+        baixar_imagem_url(data.imagem_url, mlb_id)
+        
+    conn = get_db_promo()
+    try:
+        descricao_completa = data.preco_por or ""
+        if data.preco_de and data.preco_por:
+            descricao_completa = f"De: {data.preco_de} Por: {data.preco_por}"
+        if data.cupom:
+            descricao_completa += f" (Cupom: {data.cupom})"
+            
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        conn.execute('''
+            INSERT INTO produtos (mlb_id, nome, meu_link, ultima_notificacao, vendedor, url_original, loja_origem, descricao_oferta, titulo_ia)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (mlb_id, data.titulo, data.link_afiliado or "", now_str, data.vendedor or "Loja Oficial", data.link_original, data.loja or "Mercado Livre", descricao_completa, data.titulo))
+        conn.commit()
+    except Exception as e:
+        conn.close()
+        raise HTTPException(500, f"Erro ao salvar: {str(e)}")
+    conn.close()
+    
+    return {"status": "success", "mlb_id": mlb_id, "msg": "Oferta capturada e salva na fila!"}
+
+@app.post("/api/admin/aprovar")
+def aprovar_oferta(data: AprovarRequest, authorization: str = Header(None)):
+    if authorization != TOKEN_ADMIN and authorization != SENHA_ADMIN:
+        raise HTTPException(401, "Não autorizado")
+    
+    conn = get_db_promo()
+    try:
+        conn.execute("UPDATE produtos SET meu_link = ?, titulo_ia = ?, descricao_oferta = ? WHERE mlb_id = ?", 
+                     (data.novo_link, data.novo_titulo, data.nova_descricao, data.mlb_id))
+        conn.commit()
+        row = conn.execute("SELECT vendedor, loja_origem FROM produtos WHERE mlb_id = ?", (data.mlb_id,)).fetchone()
+        conn.close()
+    except Exception as e:
+        conn.close()
+        raise HTTPException(500, f"Erro Banco: {str(e)}")
+
+    bot = app.state.bot_instance
+    if bot:
+        if data.postar_discord:
+            asyncio.run_coroutine_threadsafe(postar_discord(bot, row, data), bot.loop)
+        if data.postar_twitter:
+            threading.Thread(target=executar_post_twitter, args=(data,)).start()
+        if data.postar_threads:
+            threading.Thread(target=executar_post_threads, args=(data,)).start()
+
+    return {"msg": "Processado com sucesso"}
+
+# ==========================================
+#  LÓGICA DE POSTAGEM E EMBEDS
+# ==========================================
+
+CORES_LOJAS = {
+    "Amazon": 0xFF9900,
+    "Mercado Livre": 0xFFE600,
+    "Shopee": 0xEE4D2D,
+    "Magalu": 0x0086FF,
+    "Magazine Luiza": 0x0086FF,
+    "Kabum": 0xFF6500,
+    "AliExpress": 0xE62E04,
+    "Geral": 0x5865F2
+}
+
+class LinkView(discord.ui.View):
+    def __init__(self, url: str, label: str = "🛒 Comprar com Desconto"):
+        super().__init__(timeout=None)
+        self.add_item(discord.ui.Button(label=label, url=url, style=discord.ButtonStyle.link))
+
+def get_twitter_api():
+    if not all([TT_API_KEY, TT_API_SECRET, TT_ACCESS_TOKEN, TT_ACCESS_SECRET]): return None, None
+    try:
+        auth = tweepy.OAuth1UserHandler(TT_API_KEY, TT_API_SECRET, TT_ACCESS_TOKEN, TT_ACCESS_SECRET)
+        return tweepy.API(auth), tweepy.Client(consumer_key=TT_API_KEY, consumer_secret=TT_API_SECRET, access_token=TT_ACCESS_TOKEN, access_token_secret=TT_ACCESS_SECRET)
+    except: return None, None
+
+async def postar_discord(bot, row, data):
+    channel = bot.get_channel(int(ML_CHANNEL_ID))
+    if not channel: 
+        print(f"⚠️ [Discord] Canal ML_CHANNEL_ID ({ML_CHANNEL_ID}) não encontrado.")
+        return
+    
+    loja = (row['loja_origem'] if isinstance(row, sqlite3.Row) or isinstance(row, dict) and 'loja_origem' in row else getattr(data, 'loja', None)) or "Mercado Livre"
+    vendedor = (row['vendedor'] if isinstance(row, sqlite3.Row) or isinstance(row, dict) and 'vendedor' in row else getattr(data, 'vendedor', None)) or "Loja Verificada"
+    mlb_id = getattr(data, 'mlb_id', None) or (row['mlb_id'] if isinstance(row, dict) and 'mlb_id' in row else 'oferta')
+
+    titulo = getattr(data, 'novo_titulo', None) or getattr(data, 'titulo', '🔥 Grande Oferta!')
+    link = getattr(data, 'novo_link', None) or getattr(data, 'link', '')
+    desc_extra = getattr(data, 'descricao_extra', '')
+    nova_desc = getattr(data, 'nova_descricao', '')
+    cupom = getattr(data, 'cupom', '')
+    preco_de = getattr(data, 'preco_de', '')
+    preco_por = getattr(data, 'preco_por', '')
+
+    cor_embed = CORES_LOJAS.get(loja, 0xFFDB15)
+    
+    linhas = []
+    if desc_extra:
+        linhas.append(f"⚡ **{desc_extra}**\n")
+    
+    if preco_de and preco_por:
+        linhas.append(f"❌ De: ~~{preco_de}~~\n💰 **Por: {preco_por}**")
+    elif preco_por:
+        linhas.append(f"💰 **Preço: {preco_por}**")
+    elif nova_desc:
+        linhas.append(f"💰 **{nova_desc}**")
+        
+    if cupom:
+        linhas.append(f"\n🎟️ Use o cupom: `{cupom}`")
+        
+    if link:
+        linhas.append(f"\n🛒 **Link:** [Clique aqui para comprar]({link})")
+        
+    embed = discord.Embed(
+        title=titulo,
+        description="\n".join(linhas),
+        color=cor_embed,
+        timestamp=datetime.now()
+    )
+    embed.set_footer(text=f"Loja: {loja} • Vendedor: {vendedor} | Bifes Bot")
+    
+    img_path = f"imagens_temp/{mlb_id}.jpg"
+    view = LinkView(url=link) if link else None
+    
+    if os.path.exists(img_path):
+        file = discord.File(img_path, filename="oferta.jpg")
+        embed.set_image(url="attachment://oferta.jpg")
+        if view:
+            await channel.send(file=file, embed=embed, view=view)
+        else:
+            await channel.send(file=file, embed=embed)
+    else:
+        img_url = getattr(data, 'imagem_url', None)
+        if img_url:
+            embed.set_image(url=img_url)
+        if view:
+            await channel.send(embed=embed, view=view)
+        else:
+            await channel.send(embed=embed)
+
+def executar_post_twitter(data):
+    api_v1, client_v2 = get_twitter_api()
+    if not api_v1: return
+    
+    titulo = getattr(data, 'novo_titulo', None) or getattr(data, 'titulo', '🔥 Grande Oferta!')
+    link = getattr(data, 'novo_link', None) or getattr(data, 'link', '')
+    desc_extra = getattr(data, 'descricao_extra', '')
+    nova_desc = getattr(data, 'nova_descricao', '') or getattr(data, 'preco_por', '')
+    cupom = getattr(data, 'cupom', '')
+    mlb_id = getattr(data, 'mlb_id', 'oferta')
+    
+    txt = f"🔥 {titulo}\n\n"
+    if desc_extra: txt += f"{desc_extra}\n"
+    if nova_desc: txt += f"{nova_desc.replace('**','')}\n"
+    if cupom: txt += f"🎟️ Cupom: {cupom}\n"
+    txt += f"\n🛒 {link}"
+    
+    if len(txt) > 275: txt = txt[:270] + "..."
+    
+    media_id = None
+    img_path = f"imagens_temp/{mlb_id}.jpg"
+    if os.path.exists(img_path):
+        try: media_id = api_v1.media_upload(img_path).media_id
+        except: pass
+    
+    try: client_v2.create_tweet(text=txt, media_ids=[media_id] if media_id else None)
+    except Exception as e: print(f"Erro Twitter: {e}")
+
+def executar_post_threads(data):
+    if not THREADS_USER_ID or not THREADS_ACCESS_TOKEN: return
+    titulo = getattr(data, 'novo_titulo', None) or getattr(data, 'titulo', '🔥 Grande Oferta!')
+    link = getattr(data, 'novo_link', None) or getattr(data, 'link', '')
+    desc_extra = getattr(data, 'descricao_extra', '')
+    nova_desc = getattr(data, 'nova_descricao', '') or getattr(data, 'preco_por', '')
+    cupom = getattr(data, 'cupom', '')
+    
+    txt = f"{titulo}\n\n"
+    if desc_extra: txt += f"{desc_extra}\n"
+    if nova_desc: txt += f"{nova_desc}\n"
+    if cupom: txt += f"🎟️ Cupom: {cupom}\n"
+    txt += f"\nConfira: {link}"
+    
+    try:
+        url = f"https://graph.threads.net/v1.0/{THREADS_USER_ID}/threads"
+        res = requests.post(url, params={'media_type': 'TEXT', 'text': txt, 'access_token': THREADS_ACCESS_TOKEN})
+        if res.status_code == 200:
+            requests.post(f"https://graph.threads.net/v1.0/{THREADS_USER_ID}/threads_publish", 
+                          params={'creation_id': res.json()['id'], 'access_token': THREADS_ACCESS_TOKEN})
+    except Exception as e: print(f"Erro Threads: {e}")
+
+# ==========================================
+#  COG DO BOT (Carrega a API)
+# ==========================================
+
+class MainAPI(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+        app.state.bot_instance = bot
+        self.server_thread = threading.Thread(target=self.run_server, daemon=True)
+        self.server_thread.start()
+
+    def run_server(self):
+        cert = 'cert.pem'
+        key = 'key.pem'
+        ssl_config = {}
+        
+        use_ssl_env = os.getenv("USE_SSL", "true").lower() in ("true", "1", "yes")
+        
+        if use_ssl_env and os.path.exists(cert) and os.path.exists(key):
+            ssl_config = {"ssl_keyfile": key, "ssl_certfile": cert}
+            print(f"🌍 [API UNIFICADA] Rodando com SSL (HTTPS) na porta {PORTA}")
+        else:
+            print(f"⚠️ [API UNIFICADA] Rodando em HTTP puro na porta {PORTA}")
+            
+        uvicorn.run(app, host="0.0.0.0", port=PORTA, proxy_headers=True, forwarded_allow_ips="*", **ssl_config)
+
+async def setup(bot):
+    await bot.add_cog(MainAPI(bot))
