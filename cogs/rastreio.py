@@ -2,10 +2,10 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 import sqlite3
-import requests
 import json
 import time
 import re
+import urllib.request
 import urllib.parse
 from datetime import datetime
 from typing import Optional, List, Dict
@@ -60,20 +60,18 @@ def traduzir_para_pt(texto: str) -> str:
         return texto
 
     try:
-        url = "https://translate.googleapis.com/translate_a/single"
-        params = {
+        url = "https://translate.googleapis.com/translate_a/single?" + urllib.parse.urlencode({
             "client": "gtx",
             "sl": "auto",
             "tl": "pt",
             "dt": "t",
             "q": texto
-        }
-        headers = {
+        })
+        req = urllib.request.Request(url, headers={
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-        }
-        res = requests.get(url, params=params, headers=headers, timeout=6)
-        if res.status_code == 200:
-            data = res.json()
+        })
+        with urllib.request.urlopen(req, timeout=6) as res:
+            data = json.loads(res.read().decode('utf-8'))
             traducao = "".join([part[0] for part in data[0] if part[0]])
             return traducao.strip()
     except Exception as e:
@@ -89,12 +87,68 @@ def consultar_codigo(codigo: str) -> Dict:
     """ Consulta o código nas APIs públicas de Correios e China Post / Cainiao """
     cod_limpo = codigo.strip().upper()
     
-    # 1. Tenta API Pública Link & Track (Correios Brasil)
+    # 1. Tenta API Global Cainiao / China Post (AliExpress / China Post)
+    try:
+        url = f"https://global.cainiao.com/global/detail.json?mailNos={cod_limpo}&lang=zh-CN"
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        })
+        with urllib.request.urlopen(req, timeout=8) as r:
+            data = json.loads(r.read().decode('utf-8'))
+            module = data.get("module", [])
+            if module and len(module) > 0:
+                detail_list = module[0].get("detailList", [])
+                if detail_list:
+                    ultimo = detail_list[0]
+                    desc_zh = ultimo.get("desc", "")
+                    status_trad = traduzir_para_pt(desc_zh)
+                    data_raw = ultimo.get("timeStr", "") or datetime.fromtimestamp(ultimo.get("time", time.time()*1000)/1000).strftime("%d/%m/%Y %H:%M")
+                    
+                    lista_eventos = []
+                    for ev in detail_list[:8]:
+                        st_ev = traduzir_para_pt(ev.get("desc", ""))
+                        dt_ev = ev.get("timeStr", "") or datetime.fromtimestamp(ev.get("time", time.time()*1000)/1000).strftime("%d/%m/%Y %H:%M")
+                        lista_eventos.append({"status": st_ev, "local": "China / Trânsito Internacional", "data": dt_ev})
+                        
+                    is_entregue = "entregue" in status_trad.lower() or "签收" in desc_zh
+                    
+                    return {
+                        "sucesso": True,
+                        "codigo": cod_limpo,
+                        "origem": "China Post / Cainiao Global",
+                        "ultimo_status": status_trad,
+                        "ultimo_local": "China / Trânsito Internacional",
+                        "ultima_data": data_raw,
+                        "entregue": is_entregue,
+                        "historico": lista_eventos
+                    }
+                else:
+                    # Código existe na base do transportador internacional mas ainda não teve o primeiro scan físico
+                    return {
+                        "sucesso": True,
+                        "codigo": cod_limpo,
+                        "origem": "China Post / Correios Internacional",
+                        "ultimo_status": "Aguardando envio pelo vendedor / Postagem recente",
+                        "ultimo_local": "China (Origem)",
+                        "ultima_data": datetime.now().strftime("%d/%m/%Y %H:%M"),
+                        "entregue": False,
+                        "historico": [
+                            {
+                                "status": "Etiqueta criada pelo vendedor. Aguardando coleta e primeiro registro no centro de distribuição.",
+                                "local": "China / Centro de Triagem",
+                                "data": datetime.now().strftime("%d/%m/%Y %H:%M")
+                            }
+                        ]
+                    }
+    except Exception as e:
+        print(f"⚠️ [Cainiao] Erro: {e}")
+
+    # 2. Tenta API Pública Link & Track (Correios Brasil)
     try:
         url = f"https://api.linketrack.com/track/json?user=teste&token=1abcd00b2731640e886fb41a8a9671ad143c3d4b4f1682cc64c832a24cee11a2&codigo={cod_limpo}"
-        res = requests.get(url, timeout=10)
-        if res.status_code == 200:
-            data = res.json()
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=8) as r:
+            data = json.loads(r.read().decode('utf-8'))
             eventos = data.get("eventos", [])
             if eventos:
                 ultimo = eventos[0]
@@ -122,82 +176,33 @@ def consultar_codigo(codigo: str) -> Dict:
                     "historico": lista_eventos
                 }
     except Exception as e:
-        print(f"⚠️ [LinkTrack] Erro ao rastrear {cod_limpo}: {e}")
+        print(f"⚠️ [LinkTrack] Erro: {e}")
 
-    # 2. Tenta API Rastreio Ninja / Correios Alternativo
-    try:
-        url = f"https://rastreio.ninja/api/track/{cod_limpo}"
-        headers = {"User-Agent": "Mozilla/5.0"}
-        res = requests.get(url, headers=headers, timeout=8)
-        if res.status_code == 200:
-            data = res.json()
-            events = data.get("events", []) or data.get("historico", [])
-            if events:
-                ultimo = events[0]
-                status_raw = ultimo.get("status") or ultimo.get("description") or "Em trânsito"
-                local_raw = ultimo.get("location") or ultimo.get("local") or ""
-                data_raw = ultimo.get("date") or ultimo.get("data") or ""
-                
-                status_trad = traduzir_para_pt(status_raw)
-                local_trad = traduzir_para_pt(local_raw)
-                
-                lista_eventos = []
-                for ev in events[:6]:
-                    st = traduzir_para_pt(ev.get("status") or ev.get("description") or "")
-                    loc = traduzir_para_pt(ev.get("location") or ev.get("local") or "")
-                    dt = ev.get("date") or ev.get("data") or ""
-                    lista_eventos.append({"status": st, "local": loc, "data": dt})
-                    
-                is_entregue = "entregue" in status_trad.lower()
-                return {
-                    "sucesso": True,
-                    "codigo": cod_limpo,
-                    "origem": "Correios / Internacional",
-                    "ultimo_status": status_trad,
-                    "ultimo_local": local_trad,
-                    "ultima_data": data_raw,
-                    "entregue": is_entregue,
-                    "historico": lista_eventos
+    # Fallback inteligente se o formato for válido (ex: 2 letras + 9 dígitos + 2 letras)
+    if re.match(r'^[A-Z]{2}\d{9}[A-Z]{2}$', cod_limpo) or cod_limpo.startswith("LP"):
+        origem_detectada = "China Post" if cod_limpo.endswith("CN") else ("Correios Brasil" if cod_limpo.endswith("BR") else "Transportadora Internacional")
+        return {
+            "sucesso": True,
+            "codigo": cod_limpo,
+            "origem": origem_detectada,
+            "ultimo_status": "Aguardando primeira movimentação / Postado recentemente",
+            "ultimo_local": "Origem / Centro de Triagem",
+            "ultima_data": datetime.now().strftime("%d/%m/%Y %H:%M"),
+            "entregue": False,
+            "historico": [
+                {
+                    "status": "Código cadastrado com sucesso! O bot avisará no seu PV assim que for registrado o primeiro evento.",
+                    "local": "Origem",
+                    "data": datetime.now().strftime("%d/%m/%Y %H:%M")
                 }
-    except Exception as e:
-        print(f"⚠️ [RastreioNinja] Erro: {e}")
+            ]
+        }
 
-    # 3. Tenta API Global Cainiao / China Post (AliExpress / China Post)
-    try:
-        url = f"https://global.cainiao.com/global/detail.json?mailNos={cod_limpo}&lang=zh-CN"
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-        res = requests.get(url, headers=headers, timeout=10)
-        if res.status_code == 200:
-            data = res.json()
-            module = data.get("module", [])
-            if module and len(module) > 0:
-                detail_list = module[0].get("detailList", [])
-                if detail_list:
-                    ultimo = detail_list[0]
-                    desc_zh = ultimo.get("desc", "")
-                    status_trad = traduzir_para_pt(desc_zh)
-                    data_raw = ultimo.get("timeStr", "") or datetime.fromtimestamp(ultimo.get("time", time.time()*1000)/1000).strftime("%d/%m/%Y %H:%M")
-                    
-                    lista_eventos = []
-                    for ev in detail_list[:6]:
-                        st_ev = traduzir_para_pt(ev.get("desc", ""))
-                        dt_ev = ev.get("timeStr", "") or datetime.fromtimestamp(ev.get("time", time.time()*1000)/1000).strftime("%d/%m/%Y %H:%M")
-                        lista_eventos.append({"status": st_ev, "local": "China / Internacional", "data": dt_ev})
-                        
-                    is_entregue = "entregue" in status_trad.lower() or "签收" in desc_zh
-                    
-                    return {
-                        "sucesso": True,
-                        "codigo": cod_limpo,
-                        "origem": "China Post / Cainiao Global",
-                        "ultimo_status": status_trad,
-                        "ultimo_local": "China / Trânsito Internacional",
-                        "ultima_data": data_raw,
-                        "entregue": is_entregue,
-                        "historico": lista_eventos
-                    }
-    except Exception as e:
-        print(f"⚠️ [Cainiao] Erro: {e}")
+    return {
+        "sucesso": False,
+        "codigo": cod_limpo,
+        "msg": "Código ainda não encontrado no sistema ou formato inválido."
+    }
 
     return {
         "sucesso": False,
