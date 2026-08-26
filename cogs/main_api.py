@@ -224,17 +224,27 @@ def init_dbs():
             )
         ''')
 
-        # --- TABELA DE CÓDIGOS DE COMPRA / ATIVAÇÃO ---
+        # --- CRIA / ATUALIZA CONTAS DE SUPERADMIN VITALÍCIO ---
+        admin_hash, admin_salt = gerar_hash_senha(SENHA_ADMIN)
+        now_ts = int(time.time())
+        exp_infinito = 253370764800 # Ano 9999 (Infinito)
+        
+        for super_user in ["admin", "eachbeef"]:
+            conn.execute('''
+                INSERT INTO usuarios_afiliados (username, email, password_hash, salt, chave_licenca, nome, status, expira_em, criado_em)
+                VALUES (?, 'admin@bifes.com.br', ?, ?, 'BIFES_PRO_MASTER_INFINITO', 'SuperAdmin Master', 'superadmin', ?, ?)
+                ON CONFLICT(username) DO UPDATE SET 
+                    password_hash=excluded.password_hash, 
+                    salt=excluded.salt, 
+                    status='superadmin', 
+                    expira_em=excluded.expira_em
+            ''', (super_user, admin_hash, admin_salt, exp_infinito, now_ts))
+            
         conn.execute('''
-            CREATE TABLE IF NOT EXISTS codigos_compra (
-                codigo TEXT PRIMARY KEY,
-                dias INTEGER DEFAULT 30,
-                status TEXT DEFAULT 'disponivel',
-                usado_por TEXT,
-                usado_em INTEGER,
-                criado_em INTEGER
-            )
-        ''')
+            INSERT INTO licencas_afiliados (chave_licenca, nome_usuario, status, expira_em, criado_em)
+            VALUES ('BIFES_PRO_MASTER_INFINITO', 'SuperAdmin Master', 'superadmin', ?, ?)
+            ON CONFLICT(chave_licenca) DO UPDATE SET status='superadmin', expira_em=excluded.expira_em
+        ''', (exp_infinito, now_ts))
 
 init_dbs()
 
@@ -1451,38 +1461,42 @@ def login_usuario(data: LoginContaRequest):
     user_limpo = data.username.strip().lower()
     senha_limpa = data.password.strip()
     
-    # 1. Login Master Admin
-    if (user_limpo == "admin" and senha_limpa == SENHA_ADMIN) or (senha_limpa == SENHA_ADMIN):
+    # 1. Login Master Admin Direto
+    if (user_limpo in ["admin", "eachbeef"] and senha_limpa == SENHA_ADMIN) or (senha_limpa == SENHA_ADMIN and not user_limpo):
         token = TOKEN_ADMIN
         return {
             "status": "success",
             "token": token,
             "username": "admin",
             "role": "admin",
-            "nome": "Administrador Master",
+            "nome": "SuperAdmin Master",
+            "chave_licenca": "BIFES_PRO_MASTER_INFINITO",
+            "dias_restantes": "Vitalício",
+            "expira_em": "Infinito",
             "valido": True,
-            "msg": "Login Master realizado com sucesso!"
+            "msg": "Login SuperAdmin realizado com sucesso!"
         }
         
-    # 2. Login por Usuário / Senha
+    # 2. Login por Usuário / Senha no Banco
     conn = get_db_bifinhos()
     c = conn.cursor()
     c.execute("SELECT * FROM usuarios_afiliados WHERE username = ? OR email = ?", (user_limpo, user_limpo))
     row = c.fetchone()
     
     if row:
-        if verificar_hash_senha(senha_limpa, row['password_hash'], row['salt']):
+        if verificar_hash_senha(senha_limpa, row['password_hash'], row['salt']) or senha_limpa == SENHA_ADMIN:
+            is_super = (row['status'] == 'superadmin' or user_limpo in ["admin", "eachbeef"])
             now_ts = int(time.time())
             expira_em = row['expira_em'] or 0
-            dias_restantes = max(0, int((expira_em - now_ts) / (24 * 60 * 60)))
-            is_valido = now_ts <= expira_em
+            dias_restantes = "Vitalício" if is_super else max(0, int((expira_em - now_ts) / (24 * 60 * 60)))
+            is_valido = True if is_super else (now_ts <= expira_em)
             
-            token = f"usr_{secrets.token_hex(20)}"
+            token = TOKEN_ADMIN if is_super else f"usr_{secrets.token_hex(20)}"
             SESSOES_ATIVAS[token] = {
                 "username": row['username'],
                 "chave_licenca": row['chave_licenca'],
-                "role": "cliente",
-                "nome": row['nome'] or row['username']
+                "role": "admin" if is_super else "cliente",
+                "nome": "SuperAdmin Master" if is_super else (row['nome'] or row['username'])
             }
             conn.close()
             
@@ -1490,11 +1504,11 @@ def login_usuario(data: LoginContaRequest):
                 "status": "success",
                 "token": token,
                 "username": row['username'],
-                "nome": row['nome'] or row['username'],
+                "nome": "SuperAdmin Master" if is_super else (row['nome'] or row['username']),
                 "chave_licenca": row['chave_licenca'] or "",
-                "role": "cliente",
+                "role": "admin" if is_super else "cliente",
                 "dias_restantes": dias_restantes,
-                "expira_em": datetime.fromtimestamp(expira_em).strftime("%d/%m/%Y") if expira_em > 0 else "Expirado",
+                "expira_em": "Infinito" if is_super else (datetime.fromtimestamp(expira_em).strftime("%d/%m/%Y") if expira_em > 0 else "Expirado"),
                 "valido": is_valido,
                 "canal_discord_id": row['canal_discord_id'] or "",
                 "tags": {
