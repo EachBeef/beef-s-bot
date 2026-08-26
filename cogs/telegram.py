@@ -315,7 +315,7 @@ class TelegramListener(commands.Cog):
                         f"🟢 **Detalhes:**\n{info_verde}\n"
                         f"🏪 **Loja:** {nome_vendedor}\n"
                         f"🟡 **Link Original:** {url_real}\n"
-                        f"👉 **Painel:** https://www.bifes.com.br/promoadm.html"
+                        f"👉 **Painel:** https://www.bifes.com.br/promoadm"
                     )
                     try:
                         if caminho_imagem and os.path.exists(caminho_imagem):
