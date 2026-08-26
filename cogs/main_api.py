@@ -864,24 +864,78 @@ def xadrez_terminar(data: XadrezTerminarRequest):
     return {"status": "success", "message": "Partida encerrada com sucesso! Pontos na conta."}
 
 # ==========================================
-#  ROTAS: PROMOÇÕES (Admin)
+#  ROTAS: PROMOÇÕES (Admin & Multi-Usuário)
 # ==========================================
 
 @app.post("/api/admin/login")
 def admin_login(data: LoginRequest):
-    if data.senha == SENHA_ADMIN:
-        return {"token": TOKEN_ADMIN, "msg": "Sucesso"}
-    raise HTTPException(401, "Senha incorreta")
+    senha_limpa = data.senha.strip()
+    
+    # 1. Master Admin Global
+    if senha_limpa == SENHA_ADMIN:
+        return {
+            "token": TOKEN_ADMIN,
+            "role": "admin",
+            "nome": "Administrador Master",
+            "valido": True,
+            "msg": "Login Master realizado com sucesso!"
+        }
+        
+    # 2. Login de Afiliado por Chave de Licença
+    conn = get_db_bifinhos()
+    c = conn.cursor()
+    c.execute("SELECT * FROM licencas_afiliados WHERE chave_licenca = ?", (senha_limpa,))
+    row = c.fetchone()
+    conn.close()
+    
+    if row:
+        now_ts = int(time.time())
+        expira_em = row['expira_em'] or 0
+        dias_restantes = max(0, int((expira_em - now_ts) / (24 * 60 * 60)))
+        is_valido = now_ts <= expira_em
+        
+        return {
+            "token": senha_limpa,
+            "role": "cliente",
+            "licenca": senha_limpa,
+            "nome": row['nome_usuario'] or "Afiliado Pro",
+            "dias_restantes": dias_restantes,
+            "expira_em": datetime.fromtimestamp(expira_em).strftime("%d/%m/%Y") if expira_em > 0 else "Nunca",
+            "valido": is_valido,
+            "canal_discord_id": row['canal_discord_id'] or "",
+            "tags": {
+                "amazon": row['tag_amazon'] or "",
+                "ml": row['tag_ml'] or "",
+                "shopee": row['tag_shopee'] or "",
+                "magalu": row['tag_magalu'] or ""
+            },
+            "msg": "Login de Afiliado realizado com sucesso!"
+        }
+        
+    raise HTTPException(401, "Senha de Administrador ou Chave de Licença inválida.")
 
 @app.get("/api/admin/pendencias")
 def get_pendencias(authorization: str = Header(None)):
-    if authorization != TOKEN_ADMIN: raise HTTPException(401, "Não autorizado")
+    if not authorization:
+        raise HTTPException(401, "Não autorizado")
+        
+    is_master = (authorization == TOKEN_ADMIN or authorization == SENHA_ADMIN)
+    licenca_row = None
     
+    if not is_master:
+        conn_lic = get_db_bifinhos()
+        c = conn_lic.cursor()
+        c.execute("SELECT * FROM licencas_afiliados WHERE chave_licenca = ?", (authorization.strip(),))
+        licenca_row = c.fetchone()
+        conn_lic.close()
+        if not licenca_row:
+            raise HTTPException(401, "Licença não autorizada")
+            
     conn = get_db_promo()
     try:
         rows = conn.execute('''
             SELECT mlb_id, nome, meu_link, ultima_notificacao, vendedor, url_original, titulo_ia, descricao_oferta, loja_origem 
-            FROM produtos ORDER BY ultima_notificacao DESC LIMIT 30
+            FROM produtos ORDER BY ultima_notificacao DESC LIMIT 40
         ''').fetchall()
     except Exception as e:
         conn.close()
@@ -892,10 +946,21 @@ def get_pendencias(authorization: str = Header(None)):
     lista = []
     for row in rows:
         link_final = row['url_original'] if row['url_original'] else f"https://mercadolivre.com.br/p/{row['mlb_id']}"
+        meu_link_custom = row['meu_link'] or ""
+        
+        # Se for um cliente com tags salvas, pré-aplica a tag de afiliado dele
+        if licenca_row and not meu_link_custom:
+            loja = (row['loja_origem'] or "").lower()
+            if "amazon" in loja and licenca_row['tag_amazon']:
+                meu_link_custom = f"{link_final.split('?')[0]}?tag={licenca_row['tag_amazon']}"
+            elif "mercado" in loja and licenca_row['tag_ml']:
+                sep = "&" if "?" in link_final else "?"
+                meu_link_custom = f"{link_final}{sep}tag={licenca_row['tag_ml']}"
+                
         lista.append({
             "mlb_id": row['mlb_id'],
             "nome": row['nome'],
-            "meu_link": row['meu_link'],
+            "meu_link": meu_link_custom,
             "link_original": link_final,
             "ultima_notificacao": row['ultima_notificacao'],
             "vendedor": row['vendedor'] or "Desconhecido",
@@ -904,6 +969,63 @@ def get_pendencias(authorization: str = Header(None)):
             "loja": row['loja_origem'] or "Mercado Livre"
         })
     return lista
+
+@app.get("/api/admin/todas_licencas")
+def get_todas_licencas(authorization: str = Header(None)):
+    """ Endpoint exclusivo do Master Admin para gerenciar todas as licenças """
+    if authorization != TOKEN_ADMIN and authorization != SENHA_ADMIN:
+        raise HTTPException(401, "Acesso restrito ao Master Admin")
+        
+    conn = get_db_bifinhos()
+    c = conn.cursor()
+    c.execute("SELECT chave_licenca, discord_user_id, nome_usuario, canal_discord_id, status, expira_em, criado_em FROM licencas_afiliados ORDER BY criado_em DESC")
+    rows = c.fetchall()
+    conn.close()
+    
+    now_ts = int(time.time())
+    res = []
+    for r in rows:
+        exp = r['expira_em'] or 0
+        dias = max(0, int((exp - now_ts) / (24 * 60 * 60)))
+        res.append({
+            "chave_licenca": r['chave_licenca'],
+            "discord_user_id": r['discord_user_id'] or "Não informado",
+            "nome_usuario": r['nome_usuario'] or "Afiliado",
+            "canal_discord_id": r['canal_discord_id'] or "",
+            "status": "ativo" if now_ts <= exp else "expirado",
+            "dias_restantes": dias,
+            "expira_em": datetime.fromtimestamp(exp).strftime("%d/%m/%Y") if exp > 0 else "Nunca",
+            "criado_em": datetime.fromtimestamp(r['criado_em']).strftime("%d/%m/%Y") if r['criado_em'] else ""
+        })
+    return res
+
+class AdicionarDiasRequest(BaseModel):
+    chave_licenca: str
+    dias: int
+
+@app.post("/api/admin/licenca/adicionar_dias")
+def adicionar_dias_licenca(data: AdicionarDiasRequest, authorization: str = Header(None)):
+    if authorization != TOKEN_ADMIN and authorization != SENHA_ADMIN:
+        raise HTTPException(401, "Acesso restrito ao Master Admin")
+        
+    conn = get_db_bifinhos()
+    c = conn.cursor()
+    c.execute("SELECT expira_em FROM licencas_afiliados WHERE chave_licenca = ?", (data.chave_licenca.strip(),))
+    row = c.fetchone()
+    
+    if not row:
+        conn.close()
+        raise HTTPException(404, "Licença não encontrada")
+        
+    now_ts = int(time.time())
+    base_ts = max(now_ts, row['expira_em'] or now_ts)
+    novo_exp = base_ts + (data.dias * 24 * 60 * 60)
+    
+    c.execute("UPDATE licencas_afiliados SET expira_em = ?, status = 'ativo' WHERE chave_licenca = ?", (novo_exp, data.chave_licenca.strip()))
+    conn.commit()
+    conn.close()
+    
+    return {"status": "success", "msg": f"Adicionados +{data.dias} dias à licença {data.chave_licenca}!"}
 
 def baixar_imagem_url(url: str, mlb_id: str):
     if not url: return None
@@ -1011,8 +1133,24 @@ def capturar_oferta(data: CapturarRequest, authorization: str = Header(None)):
 
 @app.post("/api/admin/aprovar")
 def aprovar_oferta(data: AprovarRequest, authorization: str = Header(None)):
-    if authorization != TOKEN_ADMIN and authorization != SENHA_ADMIN:
+    if not authorization:
         raise HTTPException(401, "Não autorizado")
+        
+    is_master = (authorization == TOKEN_ADMIN or authorization == SENHA_ADMIN)
+    licenca_row = None
+    
+    if not is_master:
+        conn_lic = get_db_bifinhos()
+        c = conn_lic.cursor()
+        c.execute("SELECT * FROM licencas_afiliados WHERE chave_licenca = ?", (authorization.strip(),))
+        licenca_row = c.fetchone()
+        conn_lic.close()
+        if not licenca_row:
+            raise HTTPException(401, "Não autorizado")
+            
+        now_ts = int(time.time())
+        if not licenca_row['expira_em'] or now_ts > licenca_row['expira_em']:
+            raise HTTPException(403, "Licença expirada.")
     
     conn = get_db_promo()
     try:
@@ -1027,12 +1165,22 @@ def aprovar_oferta(data: AprovarRequest, authorization: str = Header(None)):
 
     bot = app.state.bot_instance
     if bot:
-        if data.postar_discord:
-            asyncio.run_coroutine_threadsafe(postar_discord(bot, row, data), bot.loop)
-        if data.postar_twitter:
-            threading.Thread(target=executar_post_twitter, args=(data,)).start()
-        if data.postar_threads:
-            threading.Thread(target=executar_post_threads, args=(data,)).start()
+        if is_master:
+            if data.postar_discord:
+                asyncio.run_coroutine_threadsafe(postar_discord(bot, row, data), bot.loop)
+            if data.postar_twitter:
+                threading.Thread(target=executar_post_twitter, args=(data,)).start()
+            if data.postar_threads:
+                threading.Thread(target=executar_post_threads, args=(data,)).start()
+        else:
+            # Posta no canal e redes do cliente
+            canal_dest = int(licenca_row['canal_discord_id']) if licenca_row['canal_discord_id'] else int(ML_CHANNEL_ID)
+            if data.postar_discord:
+                asyncio.run_coroutine_threadsafe(postar_discord_cliente(bot, canal_dest, licenca_row, data, data.mlb_id), bot.loop)
+            if data.postar_twitter and licenca_row['twitter_api_key_enc']:
+                threading.Thread(target=executar_post_twitter_cliente, args=(licenca_row, data, data.mlb_id)).start()
+            if data.postar_threads and licenca_row['threads_access_token_enc']:
+                threading.Thread(target=executar_post_threads_cliente, args=(licenca_row, data)).start()
 
     return {"msg": "Processado com sucesso"}
 
