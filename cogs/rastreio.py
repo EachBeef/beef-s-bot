@@ -274,6 +274,17 @@ def consultar_codigo_duplo(codigo: str) -> Dict:
         "historico": eventos_unificados
     }
 
+def mascarar_codigo(codigo: str) -> str:
+    """ Mascara os dígitos centrais do código para total privacidade e segurança (Ex: LZ452485036CN -> LZ45****036CN) """
+    if not codigo:
+        return ""
+    cod = codigo.strip().upper()
+    if len(cod) >= 11:
+        return f"{cod[:4]}****{cod[-5:]}"
+    elif len(cod) > 6:
+        return f"{cod[:2]}****{cod[-2:]}"
+    return cod
+
 def get_status_emoji(status: str) -> str:
     s = (status or "").lower()
     if "entregue" in s or "delivered" in s or "concluída" in s or "já entregue" in s:
@@ -301,21 +312,22 @@ class RastreioCog(commands.Cog, name="Rastreio"):
         self.verificar_rastreios_loop.cancel()
 
     # --- COMANDO SLASH: /rastrear ---
-    @app_commands.command(name="rastrear", description="Rastreia encomendas da China e Correios com tradução e alertas automáticos no PV.")
+    @app_commands.command(name="rastrear", description="Rastreia encomendas da China e Correios com privacidade e alertas no PV.")
     @app_commands.describe(
         codigo="Código de rastreio (ex: LZ452485036CN, NL123456789BR)",
         nome="Nome ou apelido para o pacote (ex: Fone Bluetooth, Teclado Mecânico)",
-        notificar_no_pv="Receber atualizações automáticas na sua Mensagem Direta (PV / DM)?"
+        notificar_no_pv="Receber atualizações automáticas na sua Mensagem Direta (PV / DM)?",
+        privado="Manter a visualização anônima e invisível para os outros no servidor?"
     )
-    async def slash_rastrear(self, interaction: discord.Interaction, codigo: str, nome: Optional[str] = "Minha Encomenda", notificar_no_pv: Optional[bool] = True):
-        await interaction.response.defer(thinking=True)
+    async def slash_rastrear(self, interaction: discord.Interaction, codigo: str, nome: Optional[str] = "Minha Encomenda", notificar_no_pv: Optional[bool] = True, privado: Optional[bool] = True):
+        await interaction.response.defer(thinking=True, ephemeral=privado)
         
         cod_limpo = codigo.strip().upper()
         res = consultar_codigo_duplo(cod_limpo)
         
         if not res.get("sucesso"):
             await interaction.followup.send(
-                f"❌ Não foi possível encontrar informações para o código **`{cod_limpo}`**.\n"
+                f"❌ Não foi possível encontrar informações para o código **`{mascarar_codigo(cod_limpo)}`**.\n"
                 f"💡 *Verifique se digitou corretamente ou se o pacote foi postado recentemente.*",
                 ephemeral=True
             )
@@ -346,12 +358,13 @@ class RastreioCog(commands.Cog, name="Rastreio"):
             ))
         conn.close()
 
+        cod_mascarado = mascarar_codigo(cod_limpo)
         emoji = get_status_emoji(res["ultimo_status"])
         cor = 0x2ECC71 if res["entregue"] else (0xF1C40F if "aduaneira" in res["ultimo_status"].lower() or "pagamento" in res["ultimo_status"].lower() else 0xFF4646)
         
         embed = discord.Embed(
             title=f"{emoji} Rastreio: {nome}",
-            description=f"**Código:** `{cod_limpo}`\n**Rota:** {res['origem']}",
+            description=f"🔒 **Código:** `{cod_mascarado}` *(Código protegido)*\n**Rota:** {res['origem']}",
             color=cor,
             timestamp=datetime.now()
         )
@@ -382,29 +395,30 @@ class RastreioCog(commands.Cog, name="Rastreio"):
         else:
             embed.set_footer(text="🎉 Encomenda entregue ao destinatário!")
 
-        await interaction.followup.send(embed=embed)
+        await interaction.followup.send(embed=embed, ephemeral=privado)
 
     # --- COMANDO SLASH: /historico_rastreio ---
-    @app_commands.command(name="historico_rastreio", description="Exibe a linha do tempo completa passo a passo de uma encomenda.")
-    @app_commands.describe(codigo="Código de rastreio")
-    async def slash_historico_rastreio(self, interaction: discord.Interaction, codigo: str):
-        await interaction.response.defer(thinking=True)
+    @app_commands.command(name="historico_rastreio", description="Exibe a linha do tempo completa e protegida de uma encomenda.")
+    @app_commands.describe(codigo="Código de rastreio", privado="Manter visualização invisível para os outros no servidor?")
+    async def slash_historico_rastreio(self, interaction: discord.Interaction, codigo: str, privado: Optional[bool] = True):
+        await interaction.response.defer(thinking=True, ephemeral=privado)
         cod_limpo = codigo.strip().upper()
         
         # Consulta dados atualizados
         res = consultar_codigo_duplo(cod_limpo)
         if not res.get("sucesso"):
-            await interaction.followup.send(f"❌ Não foi possível carregar o histórico de **`{cod_limpo}`**.", ephemeral=True)
+            await interaction.followup.send(f"❌ Não foi possível carregar o histórico de **`{mascarar_codigo(cod_limpo)}`**.", ephemeral=True)
             return
 
         historico = res.get("historico", [])
         if not historico:
-            await interaction.followup.send(f"📦 Nenhum histórico disponível ainda para **`{cod_limpo}`**.", ephemeral=True)
+            await interaction.followup.send(f"📦 Nenhum histórico disponível ainda para **`{mascarar_codigo(cod_limpo)}`**.", ephemeral=True)
             return
 
+        cod_mascarado = mascarar_codigo(cod_limpo)
         embed = discord.Embed(
-            title=f"📜 Histórico Completo: {cod_limpo}",
-            description=f"**Rota:** {res['origem']}\n**Total de Eventos:** {len(historico)}",
+            title=f"📜 Histórico Completo: {cod_mascarado}",
+            description=f"🔒 **Código:** `{cod_mascarado}` *(Protegido)*\n**Rota:** {res['origem']}\n**Total de Eventos:** {len(historico)}",
             color=0xFF4646
         )
 
@@ -418,11 +432,11 @@ class RastreioCog(commands.Cog, name="Rastreio"):
             passos_txt += f"{emoji_step} **{dt}**\n{st}{loc}\n\n"
 
         embed.add_field(name="🗺️ Linha do Tempo (China 🇨🇳 ➡️ Brasil 🇧🇷)", value=passos_txt[:1024], inline=False)
-        embed.set_footer(text="Bife's Bot • Rastreamento Internacional Integrado")
-        await interaction.followup.send(embed=embed)
+        embed.set_footer(text="Bife's Bot • Rastreamento com Privacidade Garantida")
+        await interaction.followup.send(embed=embed, ephemeral=privado)
 
     # --- COMANDO SLASH: /minhas_encomendas ---
-    @app_commands.command(name="minhas_encomendas", description="Lista todas as suas encomendas salvas para monitoramento.")
+    @app_commands.command(name="minhas_encomendas", description="Lista todas as suas encomendas salvas de forma anônima e individual.")
     async def slash_minhas_encomendas(self, interaction: discord.Interaction):
         await interaction.response.defer(thinking=True, ephemeral=True)
         
@@ -438,7 +452,7 @@ class RastreioCog(commands.Cog, name="Rastreio"):
 
         embed = discord.Embed(
             title="📦 Suas Encomendas Monitoradas",
-            description=f"Total de pacotes: **{len(rows)}**",
+            description=f"Total de pacotes: **{len(rows)}**\n🔒 *Apenas você pode ver esta lista.*",
             color=0xFF4646
         )
 
@@ -448,9 +462,10 @@ class RastreioCog(commands.Cog, name="Rastreio"):
             local_info = f"\n📍 {r['ultimo_local']}" if r['ultimo_local'] else ""
             data_info = f" • ⏰ {r['ultima_data']}" if r['ultima_data'] else ""
             pv_badge = " • 📩 PV" if (r['notificar_pv'] if 'notificar_pv' in r.keys() else 1) else " • 📢 Canal"
+            cod_masc = mascarar_codigo(r['codigo'])
             
             embed.add_field(
-                name=f"{r['nome_pacote']} (`{r['codigo']}`)",
+                name=f"{r['nome_pacote']} (`{cod_masc}`)",
                 value=f"**Status:** {status_badge}{local_info}{data_info}{pv_badge}",
                 inline=False
             )
