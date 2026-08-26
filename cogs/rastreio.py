@@ -32,13 +32,18 @@ def init_rastreio_db():
                 entregue INTEGER DEFAULT 0,
                 origem TEXT,
                 notificar_pv INTEGER DEFAULT 1,
+                historico_json TEXT,
                 criado_em INTEGER,
                 UNIQUE(codigo, user_id)
             )
         """)
-        # Adiciona coluna notificar_pv se já existia a tabela
+        # Adiciona colunas se já existia a tabela antiga
         try:
             conn.execute("ALTER TABLE rastreios ADD COLUMN notificar_pv INTEGER DEFAULT 1")
+        except:
+            pass
+        try:
+            conn.execute("ALTER TABLE rastreios ADD COLUMN historico_json TEXT")
         except:
             pass
     conn.close()
@@ -46,181 +51,240 @@ def init_rastreio_db():
 init_rastreio_db()
 
 # ===================================================
-#  TRADUTOR CHINÊS / INGLÊS -> PT-BR
+#  DICIONÁRIO E MOTOR DE TRADUÇÃO CHINÊS -> PT-BR
 # ===================================================
 
+DICIONARIO_CHINES = {
+    # Cidades e Províncias Principais de E-commerce
+    "广州市": "Guangzhou",
+    "广州": "Guangzhou",
+    "阳江市": "Yangjiang",
+    "阳江": "Yangjiang",
+    "深圳市": "Shenzhen",
+    "深圳": "Shenzhen",
+    "义乌市": "Yiwu",
+    "义乌": "Yiwu",
+    "东莞市": "Dongguan",
+    "东莞": "Dongguan",
+    "杭州市": "Hangzhou",
+    "杭州": "Hangzhou",
+    "上海市": "Shanghai",
+    "上海": "Shanghai",
+    "北京市": "Beijing",
+    "北京": "Beijing",
+    "佛山市": "Foshan",
+    "佛山": "Foshan",
+    "厦门市": "Xiamen",
+    "厦门": "Xiamen",
+    "泉州市": "Quanzhou",
+    "泉州": "Quanzhou",
+    "香港": "Hong Kong",
+    
+    # Termos Técnicos Postais e Alfandegários (frases longas primeiro)
+    "国际互换局": "Centro de Tratamento e Intercâmbio Internacional",
+    "互换局": "Centro de Intercâmbio Postal",
+    "包件车间": "Centro de Triagem de Encomendas",
+    "投递部": "Departamento de Postagem/Coleta",
+    "处理中心": "Centro de Processamento",
+    "送交出口海关": "Encaminhado para a alfândega de exportação",
+    "海关放行": "Liberado pela alfândega de exportação",
+    "出口海关": "Alfândega de exportação",
+    "海关": "Alfândega",
+    "已出口直封": "Selado em mala postal para exportação direta",
+    "已离开": "Saiu de ",
+    "已到达": "Chegou a ",
+    "正发往": "está sendo enviado para ",
+    "交航运公司运输": "Entregue à companhia aérea transportadora",
+    "航空公司接收": "Companhia aérea recebeu a carga",
+    "航空起飞": "Voo internacional decolou",
+    "飞机进港": "Voo internacional aterrissou",
+    "到达目的地": "Chegou ao país de destino (Brasil)",
+    "已妥投": "Objeto entregue ao destinatário",
+    "安排投递": "Saiu para entrega",
+    "邮件已在": "A encomenda foi classificada em",
+    "收寄": "China Post recebeu a correspondência",
+    "中国邮政": "China Post"
+}
+
 def traduzir_para_pt(texto: str) -> str:
-    """ Traduz texto em chinês ou inglês para Português usando a API do Google Translate """
+    """ Traduz e normaliza expressões chinesas ou inglesas para Português """
     if not texto:
         return ""
     
-    # Se não tiver caracteres chineses nem palavras comuns em inglês, retorna direto
-    tem_chines = bool(re.search(r'[\u4e00-\u9fff]', texto))
-    if not tem_chines and "delivered" not in texto.lower() and "transit" not in texto.lower() and "customs" not in texto.lower():
-        return texto
-
-    try:
-        url = "https://translate.googleapis.com/translate_a/single?" + urllib.parse.urlencode({
-            "client": "gtx",
-            "sl": "auto",
-            "tl": "pt",
-            "dt": "t",
-            "q": texto
-        })
-        req = urllib.request.Request(url, headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-        })
-        with urllib.request.urlopen(req, timeout=6) as res:
-            data = json.loads(res.read().decode('utf-8'))
-            traducao = "".join([part[0] for part in data[0] if part[0]])
-            return traducao.strip()
-    except Exception as e:
-        print(f"⚠️ [Tradutor] Erro ao traduzir '{texto}': {e}")
+    texto_traduzido = texto
     
-    return texto
+    # 1. Normaliza pontuação chinesa para caracteres ocidentais seguros
+    texto_traduzido = (
+        texto_traduzido
+        .replace("【", "[")
+        .replace("】", "]")
+        .replace("（", "(")
+        .replace("）", ")")
+        .replace("，", ", ")
+        .replace("。", ". ")
+        .replace("：", ": ")
+    )
+    
+    # 2. Substitui termos conhecidos pelo dicionário especializado
+    for zh, pt in DICIONARIO_CHINES.items():
+        if zh in texto_traduzido:
+            texto_traduzido = texto_traduzido.replace(zh, pt)
+
+    # 3. Se ainda contiver caracteres chineses ou inglês técnico, usa Google Translate
+    tem_chines = bool(re.search(r'[\u4e00-\u9fff]', texto_traduzido))
+    termos_ingles = any(w in texto_traduzido.lower() for w in ["delivered", "transit", "customs", "dispatch", "cleared", "departed", "arrival", "item"])
+    
+    if tem_chines or termos_ingles:
+        try:
+            url = "https://translate.googleapis.com/translate_a/single?" + urllib.parse.urlencode({
+                "client": "gtx",
+                "sl": "auto",
+                "tl": "pt",
+                "dt": "t",
+                "q": texto_traduzido
+            })
+            req = urllib.request.Request(url, headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+            })
+            with urllib.request.urlopen(req, timeout=5) as res:
+                data = json.loads(res.read().decode('utf-8'))
+                traducao = "".join([part[0] for part in data[0] if part[0]])
+                if traducao:
+                    texto_traduzido = traducao.strip()
+        except Exception as e:
+            pass
+    
+    # Limpeza estética
+    texto_traduzido = re.sub(r'\s+', ' ', texto_traduzido).strip()
+    return texto_traduzido
 
 # ===================================================
-#  APIS DE CONSULTA (CORREIOS + CHINA POST / CAINIAO)
+#  MOTOR DUPLO DE RASTREAMENTO (CHINA 🇨🇳 + BRASIL 🇧🇷)
 # ===================================================
 
-def consultar_codigo(codigo: str) -> Dict:
-    """ Consulta o código nas APIs públicas de Correios e China Post / Cainiao """
+def consultar_codigo_duplo(codigo: str) -> Dict:
+    """ Consulta a jornada completa nas duas pontas (China Post + Correios Brasil) """
     cod_limpo = codigo.strip().upper()
+    eventos_unificados = []
+    transportadora_origem = "China Post" if cod_limpo.endswith("CN") else "Internacional"
     
-    # 1. Tenta API Global Cainiao / China Post (AliExpress / China Post)
+    # --- 1. CONSULTA PONTA 1: CHINA POST / CAINIAO GLOBAL ---
     try:
-        url = f"https://global.cainiao.com/global/detail.json?mailNos={cod_limpo}&lang=zh-CN"
-        req = urllib.request.Request(url, headers={
+        url_cainiao = f"https://global.cainiao.com/global/detail.json?mailNos={cod_limpo}&lang=zh-CN"
+        req_cainiao = urllib.request.Request(url_cainiao, headers={
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
         })
-        with urllib.request.urlopen(req, timeout=8) as r:
-            data = json.loads(r.read().decode('utf-8'))
-            module = data.get("module", [])
+        with urllib.request.urlopen(req_cainiao, timeout=8) as r:
+            data_cainiao = json.loads(r.read().decode('utf-8'))
+            module = data_cainiao.get("module", [])
             if module and len(module) > 0:
                 detail_list = module[0].get("detailList", [])
-                if detail_list:
-                    ultimo = detail_list[0]
-                    desc_zh = ultimo.get("desc", "")
-                    status_trad = traduzir_para_pt(desc_zh)
-                    data_raw = ultimo.get("timeStr", "") or datetime.fromtimestamp(ultimo.get("time", time.time()*1000)/1000).strftime("%d/%m/%Y %H:%M")
+                for ev in detail_list:
+                    desc_zh = ev.get("desc", "")
+                    st_pt = traduzir_para_pt(desc_zh)
+                    dt_str = ev.get("timeStr", "")
+                    if not dt_str and ev.get("time"):
+                        dt_str = datetime.fromtimestamp(ev["time"]/1000).strftime("%Y-%m-%d %H:%M")
                     
-                    lista_eventos = []
-                    for ev in detail_list[:8]:
-                        st_ev = traduzir_para_pt(ev.get("desc", ""))
-                        dt_ev = ev.get("timeStr", "") or datetime.fromtimestamp(ev.get("time", time.time()*1000)/1000).strftime("%d/%m/%Y %H:%M")
-                        lista_eventos.append({"status": st_ev, "local": "China / Trânsito Internacional", "data": dt_ev})
-                        
-                    is_entregue = "entregue" in status_trad.lower() or "签收" in desc_zh
+                    loc = "China / Internacional"
+                    if "Guangzhou" in st_pt: loc = "Guangzhou (China)"
+                    elif "Yangjiang" in st_pt: loc = "Yangjiang (China)"
+                    elif "Shenzhen" in st_pt: loc = "Shenzhen (China)"
+                    elif "Yiwu" in st_pt: loc = "Yiwu (China)"
+                    elif "Brasil" in st_pt or "Curitiba" in st_pt: loc = "Brasil"
                     
-                    return {
-                        "sucesso": True,
-                        "codigo": cod_limpo,
-                        "origem": "China Post / Cainiao Global",
-                        "ultimo_status": status_trad,
-                        "ultimo_local": "China / Trânsito Internacional",
-                        "ultima_data": data_raw,
-                        "entregue": is_entregue,
-                        "historico": lista_eventos
-                    }
-                else:
-                    # Código existe na base do transportador internacional mas ainda não teve o primeiro scan físico
-                    return {
-                        "sucesso": True,
-                        "codigo": cod_limpo,
-                        "origem": "China Post / Correios Internacional",
-                        "ultimo_status": "Aguardando envio pelo vendedor / Postagem recente",
-                        "ultimo_local": "China (Origem)",
-                        "ultima_data": datetime.now().strftime("%d/%m/%Y %H:%M"),
-                        "entregue": False,
-                        "historico": [
-                            {
-                                "status": "Etiqueta criada pelo vendedor. Aguardando coleta e primeiro registro no centro de distribuição.",
-                                "local": "China / Centro de Triagem",
-                                "data": datetime.now().strftime("%d/%m/%Y %H:%M")
-                            }
-                        ]
-                    }
+                    eventos_unificados.append({
+                        "fase": "China / Trânsito Internacional",
+                        "status": st_pt,
+                        "local": loc,
+                        "data": dt_str,
+                        "timestamp": ev.get("time", 0)
+                    })
     except Exception as e:
-        print(f"⚠️ [Cainiao] Erro: {e}")
+        print(f"⚠️ [Cainiao] Erro na consulta de {cod_limpo}: {e}")
 
-    # 2. Tenta API Pública Link & Track (Correios Brasil)
+    # --- 2. CONSULTA PONTA 2: CORREIOS BRASIL ---
     try:
-        url = f"https://api.linketrack.com/track/json?user=teste&token=1abcd00b2731640e886fb41a8a9671ad143c3d4b4f1682cc64c832a24cee11a2&codigo={cod_limpo}"
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=8) as r:
-            data = json.loads(r.read().decode('utf-8'))
-            eventos = data.get("eventos", [])
-            if eventos:
-                ultimo = eventos[0]
-                status_trad = traduzir_para_pt(ultimo.get("status", "Objeto em Trânsito"))
-                local_trad = traduzir_para_pt(f"{ultimo.get('local', '')} {ultimo.get('origem', '')} {ultimo.get('destino', '')}".strip())
-                data_hora = f"{ultimo.get('data', '')} {ultimo.get('hora', '')}".strip()
+        url_correios = f"https://api.linketrack.com/track/json?user=teste&token=1abcd00b2731640e886fb41a8a9671ad143c3d4b4f1682cc64c832a24cee11a2&codigo={cod_limpo}"
+        req_correios = urllib.request.Request(url_correios, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req_correios, timeout=8) as r:
+            data_correios = json.loads(r.read().decode('utf-8'))
+            eventos_br = data_correios.get("eventos", [])
+            for ev in eventos_br:
+                st_br = traduzir_para_pt(ev.get("status", ""))
+                loc_br = f"{ev.get('local', '')} {ev.get('origem', '')} {ev.get('destino', '')}".strip() or "Correios Brasil"
+                dt_br = f"{ev.get('data', '')} {ev.get('hora', '')}".strip()
                 
-                lista_eventos = []
-                for ev in eventos[:6]:
-                    st = traduzir_para_pt(ev.get("status", ""))
-                    loc = traduzir_para_pt(ev.get("local", "") or ev.get("origem", ""))
-                    dt = f"{ev.get('data', '')} {ev.get('hora', '')}".strip()
-                    lista_eventos.append({"status": st, "local": loc, "data": dt})
-                
-                is_entregue = "entregue" in status_trad.lower() or "delivered" in status_trad.lower()
-                
-                return {
-                    "sucesso": True,
-                    "codigo": cod_limpo,
-                    "origem": "Correios Brasil",
-                    "ultimo_status": status_trad,
-                    "ultimo_local": local_trad,
-                    "ultima_data": data_hora,
-                    "entregue": is_entregue,
-                    "historico": lista_eventos
-                }
+                eventos_unificados.append({
+                    "fase": "Correios Brasil",
+                    "status": st_br,
+                    "local": loc_br,
+                    "data": dt_br,
+                    "timestamp": 0
+                })
     except Exception as e:
-        print(f"⚠️ [LinkTrack] Erro: {e}")
+        pass
 
-    # Fallback inteligente se o formato for válido (ex: 2 letras + 9 dígitos + 2 letras)
-    if re.match(r'^[A-Z]{2}\d{9}[A-Z]{2}$', cod_limpo) or cod_limpo.startswith("LP"):
-        origem_detectada = "China Post" if cod_limpo.endswith("CN") else ("Correios Brasil" if cod_limpo.endswith("BR") else "Transportadora Internacional")
-        return {
-            "sucesso": True,
-            "codigo": cod_limpo,
-            "origem": origem_detectada,
-            "ultimo_status": "Aguardando primeira movimentação / Postado recentemente",
-            "ultimo_local": "Origem / Centro de Triagem",
-            "ultima_data": datetime.now().strftime("%d/%m/%Y %H:%M"),
-            "entregue": False,
-            "historico": [
-                {
-                    "status": "Código cadastrado com sucesso! O bot avisará no seu PV assim que for registrado o primeiro evento.",
-                    "local": "Origem",
-                    "data": datetime.now().strftime("%d/%m/%Y %H:%M")
-                }
-            ]
-        }
+    # --- 3. SE NÃO ENCONTROU EVENTOS (PACOTE RECÉM-CRIADO) ---
+    if not eventos_unificados:
+        is_valido = re.match(r'^[A-Z]{2}\d{9}[A-Z]{2}$', cod_limpo) or cod_limpo.startswith("LP")
+        if is_valido:
+            data_agora = datetime.now().strftime("%Y-%m-%d %H:%M")
+            return {
+                "sucesso": True,
+                "codigo": cod_limpo,
+                "origem": transportadora_origem,
+                "ultimo_status": "Aguardando postagem / Informações eletrônicas recebidas",
+                "ultimo_local": "Origem (China / Transportadora)",
+                "ultima_data": data_agora,
+                "entregue": False,
+                "total_eventos": 1,
+                "historico": [
+                    {
+                        "fase": "Origem",
+                        "status": "Etiqueta criada pelo vendedor. Aguardando coleta física pela transportadora.",
+                        "local": "Origem",
+                        "data": data_agora
+                    }
+                ]
+            }
+        else:
+            return {
+                "sucesso": False,
+                "codigo": cod_limpo,
+                "msg": "Código não encontrado ou inválido."
+            }
+
+    # --- 4. ORGANIZAÇÃO DO HISTÓRICO ---
+    ultimo = eventos_unificados[0]
+    status_final = ultimo["status"]
+    local_final = ultimo["local"]
+    data_final = ultimo["data"]
+    is_entregue = any("entregue" in ev["status"].lower() or "já entregue" in ev["status"].lower() for ev in eventos_unificados)
 
     return {
-        "sucesso": False,
+        "sucesso": True,
         "codigo": cod_limpo,
-        "msg": "Código ainda não encontrado no sistema ou formato inválido."
-    }
-
-    return {
-        "sucesso": False,
-        "codigo": cod_limpo,
-        "msg": "Código ainda não encontrado no sistema ou postado recentemente. Tente novamente mais tarde."
+        "origem": f"{transportadora_origem} ➡️ Correios Brasil",
+        "ultimo_status": status_final,
+        "ultimo_local": local_final,
+        "ultima_data": data_final,
+        "entregue": is_entregue,
+        "total_eventos": len(eventos_unificados),
+        "historico": eventos_unificados
     }
 
 def get_status_emoji(status: str) -> str:
     s = (status or "").lower()
-    if "entregue" in s or "delivered" in s or "concluída" in s:
+    if "entregue" in s or "delivered" in s or "concluída" in s or "já entregue" in s:
         return "✅"
-    if "saiu para entrega" in s or "out for delivery" in s:
+    if "saiu para entrega" in s or "providenciar entrega" in s or "out for delivery" in s:
         return "🛵"
-    if "aduaneira" in s or "fiscalização" in s or "curitiba" in s or "customs" in s:
+    if "aduaneira" in s or "fiscalização" in s or "curitiba" in s or "imposto" in s or "pagamento" in s:
         return "🛃"
-    if "trânsito" in s or "encaminhado" in s or "transit" in s or "voo" in s:
+    if "trânsito" in s or "encaminhado" in s or "transferência" in s or "avião" in s or "voo" in s or "aérea" in s:
         return "✈️"
-    if "postado" in s or "recebido" in s or "posted" in s:
+    if "postado" in s or "recebido" in s or "posted" in s or "classificada" in s:
         return "📦"
     return "🚚"
 
@@ -237,17 +301,17 @@ class RastreioCog(commands.Cog, name="Rastreio"):
         self.verificar_rastreios_loop.cancel()
 
     # --- COMANDO SLASH: /rastrear ---
-    @app_commands.command(name="rastrear", description="Rastreia encomendas dos Correios, China Post e Cainiao com tradução e alertas automáticos.")
+    @app_commands.command(name="rastrear", description="Rastreia encomendas da China e Correios com tradução e alertas automáticos no PV.")
     @app_commands.describe(
-        codigo="Código de rastreio (ex: NL123456789BR, LP001234567890)",
-        nome="Nome ou apelido para o pacote (ex: Fone Bluetooth, Teclado)",
-        notificar_no_pv="Receber as atualizações automáticas na Mensagem Direta (PV / DM)?"
+        codigo="Código de rastreio (ex: LZ452485036CN, NL123456789BR)",
+        nome="Nome ou apelido para o pacote (ex: Fone Bluetooth, Teclado Mecânico)",
+        notificar_no_pv="Receber atualizações automáticas na sua Mensagem Direta (PV / DM)?"
     )
     async def slash_rastrear(self, interaction: discord.Interaction, codigo: str, nome: Optional[str] = "Minha Encomenda", notificar_no_pv: Optional[bool] = True):
         await interaction.response.defer(thinking=True)
         
         cod_limpo = codigo.strip().upper()
-        res = consultar_codigo(cod_limpo)
+        res = consultar_codigo_duplo(cod_limpo)
         
         if not res.get("sucesso"):
             await interaction.followup.send(
@@ -257,14 +321,15 @@ class RastreioCog(commands.Cog, name="Rastreio"):
             )
             return
 
-        # Salva ou atualiza no banco de dados para monitoramento
+        # Salva no banco de dados SQLite com histórico completo
         conn = get_db_rastreio()
         now_ts = int(time.time())
         pv_flag = 1 if notificar_no_pv else 0
+        hist_json = json.dumps(res.get("historico", []), ensure_ascii=False)
         with conn:
             conn.execute("""
-                INSERT INTO rastreios (codigo, nome_pacote, user_id, channel_id, ultimo_status, ultimo_local, ultima_data, entregue, origem, notificar_pv, criado_em)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO rastreios (codigo, nome_pacote, user_id, channel_id, ultimo_status, ultimo_local, ultima_data, entregue, origem, notificar_pv, historico_json, criado_em)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(codigo, user_id) DO UPDATE SET 
                     nome_pacote=excluded.nome_pacote,
                     channel_id=excluded.channel_id,
@@ -272,19 +337,22 @@ class RastreioCog(commands.Cog, name="Rastreio"):
                     ultimo_local=excluded.ultimo_local,
                     ultima_data=excluded.ultima_data,
                     notificar_pv=excluded.notificar_pv,
+                    historico_json=excluded.historico_json,
                     entregue=excluded.entregue
             """, (
                 cod_limpo, nome, str(interaction.user.id), str(interaction.channel_id),
                 res["ultimo_status"], res["ultimo_local"], res["ultima_data"],
-                1 if res["entregue"] else 0, res["origem"], pv_flag, now_ts
+                1 if res["entregue"] else 0, res["origem"], pv_flag, hist_json, now_ts
             ))
         conn.close()
 
         emoji = get_status_emoji(res["ultimo_status"])
+        cor = 0x2ECC71 if res["entregue"] else (0xF1C40F if "aduaneira" in res["ultimo_status"].lower() or "pagamento" in res["ultimo_status"].lower() else 0xFF4646)
+        
         embed = discord.Embed(
             title=f"{emoji} Rastreio: {nome}",
-            description=f"**Código:** `{cod_limpo}`\n**Transportadora:** {res['origem']}",
-            color=0xFF4646 if not res["entregue"] else 0x2ECC71,
+            description=f"**Código:** `{cod_limpo}`\n**Rota:** {res['origem']}",
+            color=cor,
             timestamp=datetime.now()
         )
         
@@ -294,25 +362,63 @@ class RastreioCog(commands.Cog, name="Rastreio"):
         if res.get("ultima_data"):
             embed.add_field(name="⏰ Data / Hora", value=res["ultima_data"], inline=True)
 
-        # Histórico recente
+        # Exibe os marcos mais recentes
         historico = res.get("historico", [])
         if len(historico) > 1:
             historico_txt = ""
-            for h in historico[1:5]:
-                historico_txt += f"• **{h['data']}** - {h['status']}"
-                if h.get('local'): historico_txt += f" ({h['local']})"
-                historico_txt += "\n"
+            for h in historico[:5]:
+                dt = h.get('data', '')
+                st = h.get('status', '')
+                loc = f" ({h['local']})" if h.get('local') and h['local'] != "China / Internacional" else ""
+                historico_txt += f"• **{dt}** - {st}{loc}\n"
             if historico_txt:
-                embed.add_field(name="📜 Histórico Recente", value=historico_txt.strip(), inline=False)
+                embed.add_field(name="📜 Últimas Movimentações (Traduzidas)", value=historico_txt.strip(), inline=False)
 
         if not res["entregue"]:
             if notificar_no_pv:
-                embed.set_footer(text="🔔 Atualizações automáticas serão enviadas no seu PV (Mensagem Direta)!")
+                embed.set_footer(text="🔔 Monitoramento ativo! Você receberá atualizações no seu PV (DM).")
             else:
-                embed.set_footer(text="🔔 Atualizações automáticas serão enviadas neste canal!")
+                embed.set_footer(text="🔔 Monitoramento ativo neste canal!")
         else:
-            embed.set_footer(text="✅ Encomenda entregue ao destinatário!")
+            embed.set_footer(text="🎉 Encomenda entregue ao destinatário!")
 
+        await interaction.followup.send(embed=embed)
+
+    # --- COMANDO SLASH: /historico_rastreio ---
+    @app_commands.command(name="historico_rastreio", description="Exibe a linha do tempo completa passo a passo de uma encomenda.")
+    @app_commands.describe(codigo="Código de rastreio")
+    async def slash_historico_rastreio(self, interaction: discord.Interaction, codigo: str):
+        await interaction.response.defer(thinking=True)
+        cod_limpo = codigo.strip().upper()
+        
+        # Consulta dados atualizados
+        res = consultar_codigo_duplo(cod_limpo)
+        if not res.get("sucesso"):
+            await interaction.followup.send(f"❌ Não foi possível carregar o histórico de **`{cod_limpo}`**.", ephemeral=True)
+            return
+
+        historico = res.get("historico", [])
+        if not historico:
+            await interaction.followup.send(f"📦 Nenhum histórico disponível ainda para **`{cod_limpo}`**.", ephemeral=True)
+            return
+
+        embed = discord.Embed(
+            title=f"📜 Histórico Completo: {cod_limpo}",
+            description=f"**Rota:** {res['origem']}\n**Total de Eventos:** {len(historico)}",
+            color=0xFF4646
+        )
+
+        # Monta a linha do tempo completa (até 15 eventos no embed)
+        passos_txt = ""
+        for idx, h in enumerate(historico[:15], 1):
+            emoji_step = get_status_emoji(h.get('status', ''))
+            dt = h.get('data', '')
+            st = h.get('status', '')
+            loc = f" - 📍 *{h['local']}*" if h.get('local') else ""
+            passos_txt += f"{emoji_step} **{dt}**\n{st}{loc}\n\n"
+
+        embed.add_field(name="🗺️ Linha do Tempo (China 🇨🇳 ➡️ Brasil 🇧🇷)", value=passos_txt[:1024], inline=False)
+        embed.set_footer(text="Bife's Bot • Rastreamento Internacional Integrado")
         await interaction.followup.send(embed=embed)
 
     # --- COMANDO SLASH: /minhas_encomendas ---
@@ -349,7 +455,7 @@ class RastreioCog(commands.Cog, name="Rastreio"):
                 inline=False
             )
 
-        embed.set_footer(text="Use /remover_rastreio <codigo> para parar de monitorar um pacote.")
+        embed.set_footer(text="Use /historico_rastreio <codigo> para ver todos os passos.")
         await interaction.followup.send(embed=embed, ephemeral=True)
 
     # --- COMANDO SLASH: /remover_rastreio ---
@@ -391,8 +497,8 @@ class RastreioCog(commands.Cog, name="Rastreio"):
                 ultimo_status_antigo = p["ultimo_status"] or ""
                 notificar_pv = p["notificar_pv"] if "notificar_pv" in p.keys() else 1
                 
-                # Consulta status atual
-                res = consultar_codigo(cod)
+                # Consulta status atualizado nas duas pontas
+                res = consultar_codigo_duplo(cod)
                 if not res.get("sucesso"):
                     continue
 
@@ -400,6 +506,7 @@ class RastreioCog(commands.Cog, name="Rastreio"):
                 novo_local = res["ultimo_local"]
                 nova_data = res["ultima_data"]
                 is_entregue = 1 if res["entregue"] else 0
+                hist_json = json.dumps(res.get("historico", []), ensure_ascii=False)
 
                 # Se o status ou data mudaram, NOTIFICA!
                 if novo_status != ultimo_status_antigo:
@@ -410,9 +517,9 @@ class RastreioCog(commands.Cog, name="Rastreio"):
                     with conn_up:
                         conn_up.execute("""
                             UPDATE rastreios 
-                            SET ultimo_status = ?, ultimo_local = ?, ultima_data = ?, entregue = ?
+                            SET ultimo_status = ?, ultimo_local = ?, ultima_data = ?, historico_json = ?, entregue = ?
                             WHERE codigo = ? AND user_id = ?
-                        """, (novo_status, novo_local, nova_data, is_entregue, cod, user_id))
+                        """, (novo_status, novo_local, nova_data, hist_json, is_entregue, cod, user_id))
                     conn_up.close()
 
                     emoji = get_status_emoji(novo_status)
@@ -431,7 +538,7 @@ class RastreioCog(commands.Cog, name="Rastreio"):
                     if is_entregue:
                         embed.set_footer(text="🎉 Encomenda entregue! Monitoramento concluído.")
                     else:
-                        embed.set_footer(text="📦 Bife's Bot • Monitoramento Automático")
+                        embed.set_footer(text="📦 Bife's Bot • Rastreamento Duplo Internacional")
 
                     enviou_pv = False
                     # 1. Tenta enviar no PV (Mensagem Direta)
@@ -442,7 +549,7 @@ class RastreioCog(commands.Cog, name="Rastreio"):
                                 await user.send(content="🔔 **Sua encomenda teve uma nova atualização!**", embed=embed)
                                 enviou_pv = True
                         except Exception as e_pv:
-                            print(f"⚠️ [Rastreio] Falha ao enviar DM para {user_id} (DMs fechadas?): {e_pv}")
+                            print(f"⚠️ [Rastreio] Falha ao enviar DM para {user_id}: {e_pv}")
 
                     # 2. Se não era para PV ou falhou envio no PV, envia no canal com menção
                     if not enviou_pv:
