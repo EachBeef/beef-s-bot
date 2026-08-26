@@ -31,10 +31,16 @@ def init_rastreio_db():
                 ultima_data TEXT,
                 entregue INTEGER DEFAULT 0,
                 origem TEXT,
+                notificar_pv INTEGER DEFAULT 1,
                 criado_em INTEGER,
                 UNIQUE(codigo, user_id)
             )
         """)
+        # Adiciona coluna notificar_pv se já existia a tabela
+        try:
+            conn.execute("ALTER TABLE rastreios ADD COLUMN notificar_pv INTEGER DEFAULT 1")
+        except:
+            pass
     conn.close()
 
 init_rastreio_db()
@@ -226,12 +232,13 @@ class RastreioCog(commands.Cog, name="Rastreio"):
         self.verificar_rastreios_loop.cancel()
 
     # --- COMANDO SLASH: /rastrear ---
-    @app_commands.command(name="rastrear", description="Rastreia uma encomenda dos Correios, China Post ou Cainiao com tradução automática.")
+    @app_commands.command(name="rastrear", description="Rastreia encomendas dos Correios, China Post e Cainiao com tradução e alertas automáticos.")
     @app_commands.describe(
         codigo="Código de rastreio (ex: NL123456789BR, LP001234567890)",
-        nome="Nome ou apelido para o pacote (ex: Fone Bluetooth, Teclado)"
+        nome="Nome ou apelido para o pacote (ex: Fone Bluetooth, Teclado)",
+        notificar_no_pv="Receber as atualizações automáticas na Mensagem Direta (PV / DM)?"
     )
-    async def slash_rastrear(self, interaction: discord.Interaction, codigo: str, nome: Optional[str] = "Minha Encomenda"):
+    async def slash_rastrear(self, interaction: discord.Interaction, codigo: str, nome: Optional[str] = "Minha Encomenda", notificar_no_pv: Optional[bool] = True):
         await interaction.response.defer(thinking=True)
         
         cod_limpo = codigo.strip().upper()
@@ -248,21 +255,23 @@ class RastreioCog(commands.Cog, name="Rastreio"):
         # Salva ou atualiza no banco de dados para monitoramento
         conn = get_db_rastreio()
         now_ts = int(time.time())
+        pv_flag = 1 if notificar_no_pv else 0
         with conn:
             conn.execute("""
-                INSERT INTO rastreios (codigo, nome_pacote, user_id, channel_id, ultimo_status, ultimo_local, ultima_data, entregue, origem, criado_em)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO rastreios (codigo, nome_pacote, user_id, channel_id, ultimo_status, ultimo_local, ultima_data, entregue, origem, notificar_pv, criado_em)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(codigo, user_id) DO UPDATE SET 
                     nome_pacote=excluded.nome_pacote,
                     channel_id=excluded.channel_id,
                     ultimo_status=excluded.ultimo_status,
                     ultimo_local=excluded.ultimo_local,
                     ultima_data=excluded.ultima_data,
+                    notificar_pv=excluded.notificar_pv,
                     entregue=excluded.entregue
             """, (
                 cod_limpo, nome, str(interaction.user.id), str(interaction.channel_id),
                 res["ultimo_status"], res["ultimo_local"], res["ultima_data"],
-                1 if res["entregue"] else 0, res["origem"], now_ts
+                1 if res["entregue"] else 0, res["origem"], pv_flag, now_ts
             ))
         conn.close()
 
@@ -292,7 +301,10 @@ class RastreioCog(commands.Cog, name="Rastreio"):
                 embed.add_field(name="📜 Histórico Recente", value=historico_txt.strip(), inline=False)
 
         if not res["entregue"]:
-            embed.set_footer(text="🔔 O bot avisará neste canal assim que houver qualquer nova movimentação!")
+            if notificar_no_pv:
+                embed.set_footer(text="🔔 Atualizações automáticas serão enviadas no seu PV (Mensagem Direta)!")
+            else:
+                embed.set_footer(text="🔔 Atualizações automáticas serão enviadas neste canal!")
         else:
             embed.set_footer(text="✅ Encomenda entregue ao destinatário!")
 
@@ -324,10 +336,11 @@ class RastreioCog(commands.Cog, name="Rastreio"):
             status_badge = "✅ Entregue" if r["entregue"] else f"{emoji} {r['ultimo_status'] or 'Em trânsito'}"
             local_info = f"\n📍 {r['ultimo_local']}" if r['ultimo_local'] else ""
             data_info = f" • ⏰ {r['ultima_data']}" if r['ultima_data'] else ""
+            pv_badge = " • 📩 PV" if (r['notificar_pv'] if 'notificar_pv' in r.keys() else 1) else " • 📢 Canal"
             
             embed.add_field(
                 name=f"{r['nome_pacote']} (`{r['codigo']}`)",
-                value=f"**Status:** {status_badge}{local_info}{data_info}",
+                value=f"**Status:** {status_badge}{local_info}{data_info}{pv_badge}",
                 inline=False
             )
 
@@ -355,7 +368,7 @@ class RastreioCog(commands.Cog, name="Rastreio"):
     # ===================================================
     @tasks.loop(minutes=25)
     async def verificar_rastreios_loop(self):
-        """ Percorre encomendas pendentes e notifica no Discord se houver atualização """
+        """ Percorre encomendas pendentes e notifica no PV ou Canal se houver atualização """
         conn = get_db_rastreio()
         c = conn.cursor()
         c.execute("SELECT * FROM rastreios WHERE entregue = 0")
@@ -371,6 +384,7 @@ class RastreioCog(commands.Cog, name="Rastreio"):
                 user_id = p["user_id"]
                 channel_id = p["channel_id"]
                 ultimo_status_antigo = p["ultimo_status"] or ""
+                notificar_pv = p["notificar_pv"] if "notificar_pv" in p.keys() else 1
                 
                 # Consulta status atual
                 res = consultar_codigo(cod)
@@ -382,7 +396,7 @@ class RastreioCog(commands.Cog, name="Rastreio"):
                 nova_data = res["ultima_data"]
                 is_entregue = 1 if res["entregue"] else 0
 
-                # Se o status ou data mudaram, NOTIFICA O USUÁRIO!
+                # Se o status ou data mudaram, NOTIFICA!
                 if novo_status != ultimo_status_antigo:
                     print(f"📦 [Rastreio] Nova movimentação para {cod}: {novo_status}")
                     
@@ -396,31 +410,43 @@ class RastreioCog(commands.Cog, name="Rastreio"):
                         """, (novo_status, novo_local, nova_data, is_entregue, cod, user_id))
                     conn_up.close()
 
-                    # Envia notificação no canal do Discord com Menção
-                    try:
-                        channel = self.bot.get_channel(int(channel_id))
-                        if channel:
-                            emoji = get_status_emoji(novo_status)
-                            embed = discord.Embed(
-                                title=f"🔔 Atualização de Encomenda: {p['nome_pacote']}",
-                                description=f"O pacote **`{cod}`** teve uma nova movimentação!",
-                                color=0x2ECC71 if is_entregue else 0xFF4646,
-                                timestamp=datetime.now()
-                            )
-                            embed.add_field(name=f"{emoji} Novo Status", value=f"**{novo_status}**", inline=False)
-                            if novo_local:
-                                embed.add_field(name="📍 Local", value=novo_local, inline=True)
-                            if nova_data:
-                                embed.add_field(name="⏰ Horário", value=nova_data, inline=True)
-                                
-                            if is_entregue:
-                                embed.set_footer(text="🎉 Encomenda entregue! Monitoramento concluído.")
-                            else:
-                                embed.set_footer(text="📦 Bife's Bot • Monitoramento Automático")
+                    emoji = get_status_emoji(novo_status)
+                    embed = discord.Embed(
+                        title=f"🔔 Atualização de Encomenda: {p['nome_pacote']}",
+                        description=f"O pacote **`{cod}`** teve uma nova movimentação!",
+                        color=0x2ECC71 if is_entregue else 0xFF4646,
+                        timestamp=datetime.now()
+                    )
+                    embed.add_field(name=f"{emoji} Novo Status", value=f"**{novo_status}**", inline=False)
+                    if novo_local:
+                        embed.add_field(name="📍 Local", value=novo_local, inline=True)
+                    if nova_data:
+                        embed.add_field(name="⏰ Horário", value=nova_data, inline=True)
+                        
+                    if is_entregue:
+                        embed.set_footer(text="🎉 Encomenda entregue! Monitoramento concluído.")
+                    else:
+                        embed.set_footer(text="📦 Bife's Bot • Monitoramento Automático")
 
-                            await channel.send(content=f"🔔 <@{user_id}> Sua encomenda foi atualizada!", embed=embed)
-                    except Exception as err_send:
-                        print(f"⚠️ Erro ao enviar mensagem de rastreio no Discord: {err_send}")
+                    enviou_pv = False
+                    # 1. Tenta enviar no PV (Mensagem Direta)
+                    if notificar_pv:
+                        try:
+                            user = await self.bot.fetch_user(int(user_id))
+                            if user:
+                                await user.send(content="🔔 **Sua encomenda teve uma nova atualização!**", embed=embed)
+                                enviou_pv = True
+                        except Exception as e_pv:
+                            print(f"⚠️ [Rastreio] Falha ao enviar DM para {user_id} (DMs fechadas?): {e_pv}")
+
+                    # 2. Se não era para PV ou falhou envio no PV, envia no canal com menção
+                    if not enviou_pv:
+                        try:
+                            channel = self.bot.get_channel(int(channel_id))
+                            if channel:
+                                await channel.send(content=f"🔔 <@{user_id}> Sua encomenda foi atualizada!", embed=embed)
+                        except Exception as err_send:
+                            print(f"⚠️ Erro ao enviar mensagem no canal: {err_send}")
 
             except Exception as err:
                 print(f"⚠️ Erro no loop de rastreio para {p['codigo']}: {err}")
