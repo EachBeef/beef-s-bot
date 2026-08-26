@@ -224,6 +224,19 @@ def init_dbs():
             )
         ''')
 
+        # --- TABELA DE CUPONS DE LOJAS ---
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS cupons_lojas (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                loja TEXT NOT NULL,
+                codigo TEXT NOT NULL,
+                descricao TEXT,
+                desconto TEXT,
+                expira_em INTEGER,
+                criado_em INTEGER
+            )
+        ''')
+
         # --- CRIA / ATUALIZA CONTAS DE SUPERADMIN VITALÍCIO ---
         admin_hash, admin_salt = gerar_hash_senha(SENHA_ADMIN)
         now_ts = int(time.time())
@@ -1594,6 +1607,87 @@ def gerar_codigos_admin(data: GerarCodigosAdminRequest, authorization: str = Hea
     conn.commit()
     conn.close()
     return {"status": "success", "codigos": novos, "dias_cada": data.dias}
+
+# ===================================================
+#  ROTAS DE CUPONS AUTOMÁTICOS PARA EXTENSÃO E PAINEL
+# ===================================================
+
+@app.get("/api/cupons/buscar")
+def buscar_cupons(loja: Optional[str] = "", url: Optional[str] = "", mlb_id: Optional[str] = ""):
+    """ Retorna cupom associado ao produto atual e cupons ativos da loja """
+    cupom_detectado = ""
+    cupons_loja = []
+    
+    # 1. Tenta achar cupom específico do produto na base de produtos
+    conn_promo = get_db_promo()
+    try:
+        if mlb_id:
+            row = conn_promo.execute("SELECT descricao_oferta FROM produtos WHERE mlb_id = ?", (mlb_id,)).fetchone()
+            if row and row['descricao_oferta']:
+                import re
+                m = re.search(r"Cupom:\s*([A-Za-z0-9_\-]+)", row['descricao_oferta'], re.IGNORECASE)
+                if m:
+                    cupom_detectado = m.group(1).strip()
+        elif url:
+            rows = conn_promo.execute("SELECT descricao_oferta, url_original FROM produtos ORDER BY id DESC LIMIT 50").fetchall()
+            for r in rows:
+                if r['url_original'] and (r['url_original'] in url or url in r['url_original']):
+                    import re
+                    m = re.search(r"Cupom:\s*([A-Za-z0-9_\-]+)", r['descricao_oferta'] or "", re.IGNORECASE)
+                    if m:
+                        cupom_detectado = m.group(1).strip()
+                        break
+    except Exception as e:
+        print(f"Erro ao buscar cupom no promo db: {e}")
+    finally:
+        conn_promo.close()
+        
+    # 2. Busca cupons gerais da loja cadastrados
+    conn_bif = get_db_bifinhos()
+    try:
+        now_ts = int(time.time())
+        loja_query = f"%{loja.strip()}%" if loja else "%"
+        c_rows = conn_bif.execute("SELECT loja, codigo, descricao, desconto FROM cupons_lojas WHERE (loja LIKE ? OR loja = 'Todas') AND (expira_em IS NULL OR expira_em = 0 OR expira_em >= ?) ORDER BY id DESC LIMIT 10", (loja_query, now_ts)).fetchall()
+        for c in c_rows:
+            cupons_loja.append({
+                "loja": c['loja'],
+                "codigo": c['codigo'],
+                "descricao": c['descricao'] or "",
+                "desconto": c['desconto'] or ""
+            })
+    except Exception as e:
+        print(f"Erro ao buscar cupons da loja: {e}")
+    finally:
+        conn_bif.close()
+        
+    return {
+        "status": "success",
+        "cupom_detectado": cupom_detectado,
+        "cupons_loja": cupons_loja
+    }
+
+class SalvarCupomRequest(BaseModel):
+    loja: str
+    codigo: str
+    descricao: Optional[str] = ""
+    desconto: Optional[str] = ""
+    dias_validade: Optional[int] = 30
+
+@app.post("/api/cupons/adicionar")
+def adicionar_cupom(data: SalvarCupomRequest, authorization: str = Header(None)):
+    if not authorization:
+        raise HTTPException(401, "Não autorizado")
+        
+    now_ts = int(time.time())
+    expira_em = now_ts + (data.dias_validade * 24 * 60 * 60) if data.dias_validade else 0
+    
+    conn = get_db_bifinhos()
+    conn.execute("INSERT INTO cupons_lojas (loja, codigo, descricao, desconto, expira_em, criado_em) VALUES (?, ?, ?, ?, ?, ?)",
+                 (data.loja, data.codigo.strip().upper(), data.descricao, data.desconto, expira_em, now_ts))
+    conn.commit()
+    conn.close()
+    
+    return {"status": "success", "msg": f"Cupom {data.codigo} cadastrado com sucesso para {data.loja}!"}
 
 @app.get("/api/licenca/verificar")
 def verificar_licenca(chave: str = Query(...)):
