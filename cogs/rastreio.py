@@ -537,11 +537,14 @@ class RastreioCog(commands.Cog, name="Rastreio"):
                         """, (novo_status, novo_local, nova_data, hist_json, is_entregue, cod, user_id))
                     conn_up.close()
 
+                    cod_masc = mascarar_codigo(cod)
                     emoji = get_status_emoji(novo_status)
+                    cor = 0x2ECC71 if is_entregue else (0xF1C40F if "aduaneira" in novo_status.lower() or "pagamento" in novo_status.lower() else 0xFF4646)
+
                     embed = discord.Embed(
-                        title=f"🔔 Atualização de Encomenda: {p['nome_pacote']}",
-                        description=f"O pacote **`{cod}`** teve uma nova movimentação!",
-                        color=0x2ECC71 if is_entregue else 0xFF4646,
+                        title=f"🔔 Atualização: {p['nome_pacote']}",
+                        description=f"📦 **Pacote:** {p['nome_pacote']}\n🔒 **Código:** `{cod_masc}`\n🚚 **Rota:** {res.get('origem', 'China Post / Correios')}",
+                        color=cor,
                         timestamp=datetime.now()
                     )
                     embed.add_field(name=f"{emoji} Novo Status", value=f"**{novo_status}**", inline=False)
@@ -549,11 +552,14 @@ class RastreioCog(commands.Cog, name="Rastreio"):
                         embed.add_field(name="📍 Local", value=novo_local, inline=True)
                     if nova_data:
                         embed.add_field(name="⏰ Horário", value=nova_data, inline=True)
+
+                    if ultimo_status_antigo:
+                        embed.add_field(name="📜 Status Anterior", value=ultimo_status_antigo, inline=False)
                         
                     if is_entregue:
-                        embed.set_footer(text="🎉 Encomenda entregue! Monitoramento concluído.")
+                        embed.set_footer(text="🎉 Encomenda entregue! Monitoramento concluído com sucesso.")
                     else:
-                        embed.set_footer(text="📦 Bife's Bot • Rastreamento Duplo Internacional")
+                        embed.set_footer(text="Bife's Bot • Monitoramento Automático em Tempo Real")
 
                     enviou_pv = False
                     # 1. Tenta enviar no PV (Mensagem Direta)
@@ -561,7 +567,7 @@ class RastreioCog(commands.Cog, name="Rastreio"):
                         try:
                             user = await self.bot.fetch_user(int(user_id))
                             if user:
-                                await user.send(content="🔔 **Sua encomenda teve uma nova atualização!**", embed=embed)
+                                await user.send(content=f"🔔 **Atualização no pacote `{p['nome_pacote']}` (`{cod_masc}`)!**", embed=embed)
                                 enviou_pv = True
                         except Exception as e_pv:
                             print(f"⚠️ [Rastreio] Falha ao enviar DM para {user_id}: {e_pv}")
@@ -571,7 +577,7 @@ class RastreioCog(commands.Cog, name="Rastreio"):
                         try:
                             channel = self.bot.get_channel(int(channel_id))
                             if channel:
-                                await channel.send(content=f"🔔 <@{user_id}> Sua encomenda foi atualizada!", embed=embed)
+                                await channel.send(content=f"🔔 <@{user_id}> O seu pacote **`{p['nome_pacote']}`** (`{cod_masc}`) foi atualizado!", embed=embed)
                         except Exception as err_send:
                             print(f"⚠️ Erro ao enviar mensagem no canal: {err_send}")
 
