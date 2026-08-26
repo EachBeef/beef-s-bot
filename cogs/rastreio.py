@@ -404,34 +404,92 @@ class RastreioCog(commands.Cog, name="Rastreio"):
         await interaction.response.defer(thinking=True, ephemeral=privado)
         cod_limpo = codigo.strip().upper()
         
-        # Consulta dados atualizados
-        res = consultar_codigo_duplo(cod_limpo)
-        if not res.get("sucesso"):
-            await interaction.followup.send(f"❌ Não foi possível carregar o histórico de **`{mascarar_codigo(cod_limpo)}`**.", ephemeral=True)
-            return
+        # 1. Busca no banco de dados local primeiro
+        conn = get_db_rastreio()
+        row = conn.execute("SELECT * FROM rastreios WHERE codigo = ? AND user_id = ?", (cod_limpo, str(interaction.user.id))).fetchone()
+        if not row:
+            row = conn.execute("SELECT * FROM rastreios WHERE codigo = ?", (cod_limpo,)).fetchone()
+        conn.close()
 
-        historico = res.get("historico", [])
-        if not historico:
+        historico_db = []
+        if row and row['historico_json']:
+            try:
+                historico_db = json.loads(row['historico_json'])
+            except:
+                pass
+
+        # 2. Consulta a API ao vivo
+        res = consultar_codigo_duplo(cod_limpo)
+        historico_live = res.get("historico", []) if res.get("sucesso") else []
+
+        # 3. Mescla eventos evitando duplicatas
+        eventos_finais = []
+        chaves_vistas = set()
+
+        for ev in (historico_live + historico_db):
+            chave = f"{ev.get('data', '')}_{ev.get('status', '')}".strip()
+            if chave and chave not in chaves_vistas:
+                chaves_vistas.add(chave)
+                eventos_finais.append(ev)
+
+        if not eventos_finais:
             await interaction.followup.send(f"📦 Nenhum histórico disponível ainda para **`{mascarar_codigo(cod_limpo)}`**.", ephemeral=True)
             return
 
+        # 4. Atualiza o banco com o histórico mesclado
+        conn_up = get_db_rastreio()
+        with conn_up:
+            conn_up.execute("""
+                UPDATE rastreios 
+                SET historico_json = ?, ultimo_status = ?, ultima_data = ?
+                WHERE codigo = ?
+            """, (json.dumps(eventos_finais, ensure_ascii=False), eventos_finais[0]['status'], eventos_finais[0]['data'], cod_limpo))
+        conn_up.close()
+
         cod_mascarado = mascarar_codigo(cod_limpo)
+        nome_display = row['nome_pacote'] if (row and row['nome_pacote']) else "Encomenda"
+        is_entregue = any("entregue" in ev.get("status", "").lower() or "já entregue" in ev.get("status", "").lower() for ev in eventos_finais)
+
         embed = discord.Embed(
-            title=f"📜 Histórico Completo: {cod_mascarado}",
-            description=f"🔒 **Código:** `{cod_mascarado}` *(Protegido)*\n**Rota:** {res['origem']}\n**Total de Eventos:** {len(historico)}",
-            color=0xFF4646
+            title=f"📜 Histórico Completo: {nome_display}",
+            description=f"🔒 **Código:** `{cod_mascarado}` *(Protegido)*\n**Total de Eventos:** {len(eventos_finais)} marcos registrados",
+            color=0x2ECC71 if is_entregue else 0xFF4646,
+            timestamp=datetime.now()
         )
 
-        # Monta a linha do tempo completa (até 15 eventos no embed)
-        passos_txt = ""
-        for idx, h in enumerate(historico[:15], 1):
-            emoji_step = get_status_emoji(h.get('status', ''))
-            dt = h.get('data', '')
-            st = h.get('status', '')
-            loc = f" - 📍 *{h['local']}*" if h.get('local') else ""
-            passos_txt += f"{emoji_step} **{dt}**\n{st}{loc}\n\n"
+        # Separa os eventos por blocos para caber perfeitamente no limite do Discord
+        eventos_china = [ev for ev in eventos_finais if "China" in ev.get("local", "") or "Guangzhou" in ev.get("status", "") or "Yangjiang" in ev.get("status", "") or "voo" in ev.get("status", "").lower() or "aérea" in ev.get("status", "").lower() or "510400" in ev.get("status", "") or "5299" in ev.get("status", "")]
+        eventos_brasil = [ev for ev in eventos_finais if ev not in eventos_china]
 
-        embed.add_field(name="🗺️ Linha do Tempo (China 🇨🇳 ➡️ Brasil 🇧🇷)", value=passos_txt[:1024], inline=False)
+        if eventos_china:
+            txt_china = ""
+            for h in eventos_china[:10]:
+                emoji_step = get_status_emoji(h.get('status', ''))
+                dt = h.get('data', '')
+                st = h.get('status', '')
+                loc = f" ({h['local']})" if h.get('local') and h['local'] != "China / Internacional" else ""
+                txt_china += f"{emoji_step} **{dt}** — {st}{loc}\n"
+            if txt_china:
+                embed.add_field(name="🇨🇳 Origem (China Post & Voo Internacional)", value=txt_china[:1024], inline=False)
+
+        if eventos_brasil:
+            txt_br = ""
+            for h in eventos_brasil[:10]:
+                emoji_step = get_status_emoji(h.get('status', ''))
+                dt = h.get('data', '')
+                st = h.get('status', '')
+                loc = f" ({h['local']})" if h.get('local') and h['local'] != "Correios Brasil" else ""
+                txt_br += f"{emoji_step} **{dt}** — {st}{loc}\n"
+            if txt_br:
+                embed.add_field(name="🇧🇷 Destino (Correios Brasil & Entrega)", value=txt_br[:1024], inline=False)
+
+        if not eventos_china and not eventos_brasil:
+            txt_geral = ""
+            for h in eventos_finais[:12]:
+                emoji_step = get_status_emoji(h.get('status', ''))
+                txt_geral += f"{emoji_step} **{h.get('data','')}** — {h.get('status','')}\n"
+            embed.add_field(name="🗺️ Linha do Tempo", value=txt_geral[:1024], inline=False)
+
         embed.set_footer(text="Bife's Bot • Rastreamento com Privacidade Garantida")
         await interaction.followup.send(embed=embed, ephemeral=privado)
 
