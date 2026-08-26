@@ -1613,52 +1613,90 @@ def gerar_codigos_admin(data: GerarCodigosAdminRequest, authorization: str = Hea
 # ===================================================
 
 @app.get("/api/cupons/buscar")
-def buscar_cupons(loja: Optional[str] = "", url: Optional[str] = "", mlb_id: Optional[str] = ""):
+def buscar_cupons(loja: Optional[str] = "", url: Optional[str] = "", mlb_id: Optional[str] = "", titulo: Optional[str] = ""):
     """ Retorna cupom associado ao produto atual e cupons ativos da loja """
     cupom_detectado = ""
     cupons_loja = []
     
-    # 1. Tenta achar cupom específico do produto na base de produtos
     conn_promo = get_db_promo()
     try:
-        if mlb_id:
-            row = conn_promo.execute("SELECT descricao_oferta FROM produtos WHERE mlb_id = ?", (mlb_id,)).fetchone()
-            if row and row['descricao_oferta']:
-                import re
-                m = re.search(r"Cupom:\s*([A-Za-z0-9_\-]+)", row['descricao_oferta'], re.IGNORECASE)
-                if m:
-                    cupom_detectado = m.group(1).strip()
-        elif url:
-            rows = conn_promo.execute("SELECT descricao_oferta, url_original FROM produtos ORDER BY id DESC LIMIT 50").fetchall()
-            for r in rows:
-                if r['url_original'] and (r['url_original'] in url or url in r['url_original']):
-                    import re
-                    m = re.search(r"Cupom:\s*([A-Za-z0-9_\-]+)", r['descricao_oferta'] or "", re.IGNORECASE)
-                    if m:
-                        cupom_detectado = m.group(1).strip()
-                        break
+        import re
+        
+        # 1. Busca produtos recentes da mesma loja no banco para extrair cupons
+        loja_query = f"%{loja.strip()}%" if loja else "%"
+        rows = conn_promo.execute(
+            "SELECT nome, titulo_ia, meu_link, url_original, mlb_id, descricao_oferta, loja_origem FROM produtos "
+            "WHERE (loja_origem LIKE ? OR ? = '') ORDER BY id DESC LIMIT 50", 
+            (loja_query, loja or "")
+        ).fetchall()
+        
+        cupons_encontrados_set = []
+        palavras_titulo = [w.lower() for w in (titulo or "").split() if len(w) > 3][:6]
+        
+        for r in rows:
+            desc = r['descricao_oferta'] or ""
+            m = re.search(r"(?:(?:Use o )?[Cc]upom|CUPOM)[:\s]+([A-Za-z0-9_\-]+)", desc)
+            if not m:
+                m = re.search(r"\(([Cc]upom:\s*[A-Za-z0-9_\-]+)\)", desc)
+            
+            if m:
+                cod = m.group(1).replace("Cupom:", "").replace("cupom:", "").strip().upper()
+                if len(cod) >= 3:
+                    if cod not in cupons_encontrados_set:
+                        cupons_encontrados_set.append(cod)
+                    
+                    # Se bater por MLB_ID ou URL
+                    if mlb_id and mlb_id == r['mlb_id']:
+                        cupom_detectado = cod
+                    elif url and r['url_original'] and (r['url_original'] in url or url in r['url_original']):
+                        cupom_detectado = cod
+                    # Se o título tiver palavras-chave coincidentes
+                    elif palavras_titulo and not cupom_detectado:
+                        nome_db = (r['nome'] or "") + " " + (r['titulo_ia'] or "")
+                        matches = sum(1 for w in palavras_titulo if w in nome_db.lower())
+                        if matches >= 2:
+                            cupom_detectado = cod
+                            
+        for cod in cupons_encontrados_set:
+            cupons_loja.append({
+                "loja": loja or "Loja",
+                "codigo": cod,
+                "descricao": f"Cupom Recente ({loja})",
+                "desconto": ""
+            })
+            
     except Exception as e:
         print(f"Erro ao buscar cupom no promo db: {e}")
     finally:
         conn_promo.close()
         
-    # 2. Busca cupons gerais da loja cadastrados
+    # 2. Busca também na tabela cupons_lojas
     conn_bif = get_db_bifinhos()
     try:
         now_ts = int(time.time())
         loja_query = f"%{loja.strip()}%" if loja else "%"
-        c_rows = conn_bif.execute("SELECT loja, codigo, descricao, desconto FROM cupons_lojas WHERE (loja LIKE ? OR loja = 'Todas') AND (expira_em IS NULL OR expira_em = 0 OR expira_em >= ?) ORDER BY id DESC LIMIT 10", (loja_query, now_ts)).fetchall()
+        c_rows = conn_bif.execute(
+            "SELECT loja, codigo, descricao, desconto FROM cupons_lojas "
+            "WHERE (loja LIKE ? OR loja = 'Todas') AND (expira_em IS NULL OR expira_em = 0 OR expira_em >= ?) "
+            "ORDER BY id DESC LIMIT 15", 
+            (loja_query, now_ts)
+        ).fetchall()
         for c in c_rows:
-            cupons_loja.append({
-                "loja": c['loja'],
-                "codigo": c['codigo'],
-                "descricao": c['descricao'] or "",
-                "desconto": c['desconto'] or ""
-            })
+            if not any(x['codigo'] == c['codigo'] for x in cupons_loja):
+                cupons_loja.append({
+                    "loja": c['loja'],
+                    "codigo": c['codigo'],
+                    "descricao": c['descricao'] or "",
+                    "desconto": c['desconto'] or ""
+                })
     except Exception as e:
         print(f"Erro ao buscar cupons da loja: {e}")
     finally:
         conn_bif.close()
+        
+    # Se não achou cupom específico pelo link mas tem cupons recentes da loja, sugere o mais recente
+    if not cupom_detectado and cupons_loja:
+        cupom_detectado = cupons_loja[0]["codigo"]
         
     return {
         "status": "success",
