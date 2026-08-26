@@ -37,10 +37,7 @@ def encriptar_dado(texto: str) -> str:
     enc_key, hmac_key = _derivar_chaves(salt)
     keystream = _gerar_keystream(enc_key, iv, len(texto_bytes))
     
-    # Cifra por XOR com o keystream seguro
     ciphertext = bytes(a ^ b for a, b in zip(texto_bytes, keystream))
-    
-    # Gera assinatura HMAC sobre (salt + iv + ciphertext) para integridade (AEAD)
     tag = hmac.new(hmac_key, salt + iv + ciphertext, hashlib.sha256).digest()
     
     payload = salt + iv + tag + ciphertext
@@ -65,7 +62,6 @@ def decriptar_dado(texto_cifrado: str) -> str:
         
         enc_key, hmac_key = _derivar_chaves(salt)
         
-        # Validação da tag HMAC em tempo constante
         expected_tag = hmac.new(hmac_key, salt + iv + ciphertext, hashlib.sha256).digest()
         if not hmac.compare_digest(tag, expected_tag):
             print("⚠️ [Criptografia] Falha de integridade ao decriptar dado (tag inválida).")
@@ -77,3 +73,16 @@ def decriptar_dado(texto_cifrado: str) -> str:
     except Exception as e:
         print(f"⚠️ [Criptografia] Erro ao decriptar: {e}")
         return ""
+
+def gerar_hash_senha(senha: str):
+    """ Gera um salt seguro e o hash PBKDF2 da senha """
+    salt = secrets.token_hex(16)
+    hash_bytes = hashlib.pbkdf2_hmac('sha256', senha.encode('utf-8'), salt.encode('utf-8'), 100000)
+    return hash_bytes.hex(), salt
+
+def verificar_hash_senha(senha: str, hash_hex: str, salt: str) -> bool:
+    """ Valida a senha contra o hash e salt armazenados em tempo constante """
+    if not senha or not hash_hex or not salt:
+        return False
+    calc_hash = hashlib.pbkdf2_hmac('sha256', senha.encode('utf-8'), salt.encode('utf-8'), 100000).hex()
+    return hmac.compare_digest(calc_hash, hash_hex)

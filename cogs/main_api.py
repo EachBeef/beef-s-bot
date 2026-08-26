@@ -1,10 +1,10 @@
 import discord
 from discord.ext import commands
-from fastapi import FastAPI, HTTPException, Request, Header, WebSocket, WebSocketDisconnect, Query
+from fastapi import FastAPI, HTTPException, Request, Header, WebSocket, WebSocketDisconnect, Query, Depends
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from cogs.criptografia import encriptar_dado, decriptar_dado
+from cogs.criptografia import encriptar_dado, decriptar_dado, gerar_hash_senha, verificar_hash_senha
 import sqlite3
 import uvicorn
 import asyncio
@@ -196,6 +196,46 @@ def init_dbs():
             )
         ''')
 
+        # --- TABELA DE USUÁRIOS (LOGIN & SENHA) ---
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS usuarios_afiliados (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                email TEXT,
+                password_hash TEXT NOT NULL,
+                salt TEXT NOT NULL,
+                chave_licenca TEXT,
+                nome TEXT,
+                discord_user_id TEXT,
+                canal_discord_id TEXT,
+                tag_amazon TEXT,
+                tag_ml TEXT,
+                tag_shopee TEXT,
+                tag_magalu TEXT,
+                twitter_api_key_enc TEXT,
+                twitter_api_secret_enc TEXT,
+                twitter_access_token_enc TEXT,
+                twitter_access_secret_enc TEXT,
+                threads_user_id_enc TEXT,
+                threads_access_token_enc TEXT,
+                status TEXT DEFAULT 'trial',
+                expira_em INTEGER DEFAULT 0,
+                criado_em INTEGER
+            )
+        ''')
+
+        # --- TABELA DE CÓDIGOS DE COMPRA / ATIVAÇÃO ---
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS codigos_compra (
+                codigo TEXT PRIMARY KEY,
+                dias INTEGER DEFAULT 30,
+                status TEXT DEFAULT 'disponivel',
+                usado_por TEXT,
+                usado_em INTEGER,
+                criado_em INTEGER
+            )
+        ''')
+
 init_dbs()
 
 # --- FUNÇÃO AUXILIAR PARA REGISTRAR GANHOS ---
@@ -325,6 +365,25 @@ class PostarLicencaRequest(BaseModel):
     postar_discord: bool = True
     postar_twitter: bool = False
     postar_threads: bool = False
+
+# --- MODELOS DE AUTENTICAÇÃO COM USUÁRIO E SENHA ---
+
+class CadastroUsuarioRequest(BaseModel):
+    username: str
+    password: str
+    email: Optional[str] = ""
+    nome: Optional[str] = ""
+
+class LoginContaRequest(BaseModel):
+    username: str
+    password: str
+
+class ResgatarCodigoCompraRequest(BaseModel):
+    codigo: str
+
+class GerarCodigosAdminRequest(BaseModel):
+    quantidade: int = 1
+    dias: int = 30
 
 # ==========================================
 #  ROTAS: MERCADO PAGO E SISTEMA VIP
@@ -1326,8 +1385,201 @@ def executar_post_threads(data):
     except Exception as e: print(f"Erro Threads: {e}")
 
 # ===================================================
-#  ROTAS SAAS: LICENÇAS, AFILIADOS E CRIPTOGRAFIA
+#  ROTAS DE AUTENTICAÇÃO COM USUÁRIO, SENHA E CÓDIGOS
 # ===================================================
+
+SESSOES_ATIVAS: Dict[str, dict] = {}
+
+@app.post("/api/auth/cadastro")
+def cadastrar_usuario(data: CadastroUsuarioRequest):
+    user_limpo = data.username.strip().lower()
+    if len(user_limpo) < 3:
+        raise HTTPException(400, "O nome de usuário deve ter pelo menos 3 caracteres.")
+    if len(data.password) < 4:
+        raise HTTPException(400, "A senha deve ter pelo menos 4 caracteres.")
+        
+    conn = get_db_bifinhos()
+    c = conn.cursor()
+    c.execute("SELECT id FROM usuarios_afiliados WHERE username = ?", (user_limpo,))
+    if c.fetchone():
+        conn.close()
+        raise HTTPException(400, "Este nome de usuário já está em uso.")
+        
+    pw_hash, salt = gerar_hash_senha(data.password)
+    now_ts = int(time.time())
+    chave_pessoal = f"BIFES_PRO_{secrets.token_hex(6).upper()}"
+    expira_em = now_ts + (3 * 24 * 60 * 60) # 3 Dias de Trial Grátis automático
+    
+    c.execute("""
+        INSERT INTO usuarios_afiliados (username, email, password_hash, salt, chave_licenca, nome, status, expira_em, criado_em)
+        VALUES (?, ?, ?, ?, ?, ?, 'trial', ?, ?)
+    """, (user_limpo, data.email.strip() if data.email else "", pw_hash, salt, chave_pessoal, data.nome or data.username, expira_em, now_ts))
+    
+    # Cria também na tabela de licenças para compatibilidade com a extensão
+    c.execute("""
+        INSERT INTO licencas_afiliados (chave_licenca, nome_usuario, status, expira_em, criado_em)
+        VALUES (?, ?, 'trial', ?, ?)
+        ON CONFLICT(chave_licenca) DO NOTHING
+    """, (chave_pessoal, data.nome or data.username, expira_em, now_ts))
+    
+    conn.commit()
+    conn.close()
+    
+    token = f"usr_{secrets.token_hex(20)}"
+    SESSOES_ATIVAS[token] = {
+        "username": user_limpo,
+        "chave_licenca": chave_pessoal,
+        "role": "cliente",
+        "nome": data.nome or data.username
+    }
+    
+    return {
+        "status": "success",
+        "token": token,
+        "username": user_limpo,
+        "nome": data.nome or data.username,
+        "chave_licenca": chave_pessoal,
+        "role": "cliente",
+        "dias_restantes": 3,
+        "expira_em": datetime.fromtimestamp(expira_em).strftime("%d/%m/%Y"),
+        "valido": True,
+        "msg": "Cadastro realizado com sucesso! Você ganhou 3 dias de Teste Grátis."
+    }
+
+@app.post("/api/auth/login")
+def login_usuario(data: LoginContaRequest):
+    user_limpo = data.username.strip().lower()
+    senha_limpa = data.password.strip()
+    
+    # 1. Login Master Admin
+    if (user_limpo == "admin" and senha_limpa == SENHA_ADMIN) or (senha_limpa == SENHA_ADMIN):
+        token = TOKEN_ADMIN
+        return {
+            "status": "success",
+            "token": token,
+            "username": "admin",
+            "role": "admin",
+            "nome": "Administrador Master",
+            "valido": True,
+            "msg": "Login Master realizado com sucesso!"
+        }
+        
+    # 2. Login por Usuário / Senha
+    conn = get_db_bifinhos()
+    c = conn.cursor()
+    c.execute("SELECT * FROM usuarios_afiliados WHERE username = ? OR email = ?", (user_limpo, user_limpo))
+    row = c.fetchone()
+    
+    if row:
+        if verificar_hash_senha(senha_limpa, row['password_hash'], row['salt']):
+            now_ts = int(time.time())
+            expira_em = row['expira_em'] or 0
+            dias_restantes = max(0, int((expira_em - now_ts) / (24 * 60 * 60)))
+            is_valido = now_ts <= expira_em
+            
+            token = f"usr_{secrets.token_hex(20)}"
+            SESSOES_ATIVAS[token] = {
+                "username": row['username'],
+                "chave_licenca": row['chave_licenca'],
+                "role": "cliente",
+                "nome": row['nome'] or row['username']
+            }
+            conn.close()
+            
+            return {
+                "status": "success",
+                "token": token,
+                "username": row['username'],
+                "nome": row['nome'] or row['username'],
+                "chave_licenca": row['chave_licenca'] or "",
+                "role": "cliente",
+                "dias_restantes": dias_restantes,
+                "expira_em": datetime.fromtimestamp(expira_em).strftime("%d/%m/%Y") if expira_em > 0 else "Expirado",
+                "valido": is_valido,
+                "canal_discord_id": row['canal_discord_id'] or "",
+                "tags": {
+                    "amazon": row['tag_amazon'] or "",
+                    "ml": row['tag_ml'] or "",
+                    "shopee": row['tag_shopee'] or "",
+                    "magalu": row['tag_magalu'] or ""
+                },
+                "msg": "Login realizado com sucesso!"
+            }
+            
+    conn.close()
+    raise HTTPException(401, "Usuário ou senha incorretos.")
+
+@app.post("/api/licenca/resgatar_codigo")
+def resgatar_codigo_compra(data: ResgatarCodigoCompraRequest, authorization: str = Header(None)):
+    if not authorization:
+        raise HTTPException(401, "Faça login para resgatar seu código.")
+        
+    codigo_limpo = data.codigo.strip().upper()
+    sessao = SESSOES_ATIVAS.get(authorization)
+    username = sessao["username"] if sessao else None
+    
+    conn = get_db_bifinhos()
+    c = conn.cursor()
+    
+    # 1. Procura na tabela de códigos de compra
+    c.execute("SELECT * FROM codigos_compra WHERE codigo = ? AND status = 'disponivel'", (codigo_limpo,))
+    cod_row = c.fetchone()
+    
+    dias_adicionar = 30
+    
+    if cod_row:
+        dias_adicionar = cod_row['dias'] or 30
+        c.execute("UPDATE codigos_compra SET status = 'resgatado', usado_por = ?, usado_em = ? WHERE codigo = ?", 
+                  (username or "cliente", int(time.time()), codigo_limpo))
+    else:
+        # 2. Caso seja uma chave gerada pelo Mercado Pago (BIFES_PRO_...)
+        c.execute("SELECT * FROM licencas_afiliados WHERE chave_licenca = ?", (codigo_limpo,))
+        lic_row = c.fetchone()
+        if not lic_row:
+            conn.close()
+            raise HTTPException(404, "Código de ativação inválido ou já resgatado.")
+            
+    now_ts = int(time.time())
+    
+    # Atualiza o usuário
+    if username:
+        c.execute("SELECT expira_em, chave_licenca FROM usuarios_afiliados WHERE username = ?", (username,))
+        u_row = c.fetchone()
+        if u_row:
+            base_ts = max(now_ts, u_row['expira_em'] or now_ts)
+            novo_exp = base_ts + (dias_adicionar * 24 * 60 * 60)
+            c.execute("UPDATE usuarios_afiliados SET expira_em = ?, status = 'pro' WHERE username = ?", (novo_exp, username))
+            if u_row['chave_licenca']:
+                c.execute("UPDATE licencas_afiliados SET expira_em = ?, status = 'ativo' WHERE chave_licenca = ?", (novo_exp, u_row['chave_licenca']))
+                
+    conn.commit()
+    conn.close()
+    
+    return {
+        "status": "success",
+        "dias_adicionados": dias_adicionar,
+        "msg": f"🎉 Parabéns! Código ativado com sucesso. Foram adicionados +{dias_adicionar} dias de Plano Pro à sua conta!"
+    }
+
+@app.post("/api/admin/gerar_codigos")
+def gerar_codigos_admin(data: GerarCodigosAdminRequest, authorization: str = Header(None)):
+    if authorization != TOKEN_ADMIN and authorization != SENHA_ADMIN:
+        raise HTTPException(401, "Acesso restrito ao Master Admin.")
+        
+    conn = get_db_bifinhos()
+    c = conn.cursor()
+    novos = []
+    now_ts = int(time.time())
+    
+    for _ in range(max(1, min(data.quantidade, 50))):
+        code = f"BIFES_PRO_{secrets.token_hex(4).upper()}"
+        c.execute("INSERT INTO codigos_compra (codigo, dias, status, criado_em) VALUES (?, ?, 'disponivel', ?)", 
+                  (code, data.dias, now_ts))
+        novos.append(code)
+        
+    conn.commit()
+    conn.close()
+    return {"status": "success", "codigos": novos, "dias_cada": data.dias}
 
 @app.get("/api/licenca/verificar")
 def verificar_licenca(chave: str = Query(...)):
