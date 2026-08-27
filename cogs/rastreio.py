@@ -229,21 +229,31 @@ def consultar_codigo_duplo(codigo: str) -> Dict:
     if not eventos_unificados:
         is_valido = re.match(r'^[A-Z]{2}\d{9}[A-Z]{2}$', cod_limpo) or cod_limpo.startswith("LP")
         if is_valido:
+            # Tenta preservar a data de cadastro original do banco
             data_agora = datetime.now().strftime("%Y-%m-%d %H:%M")
+            try:
+                conn_tmp = get_db_rastreio()
+                row_tmp = conn_tmp.execute("SELECT ultima_data, criado_em FROM rastreios WHERE codigo = ?", (cod_limpo,)).fetchone()
+                conn_tmp.close()
+                if row_tmp and row_tmp['ultima_data']:
+                    data_agora = row_tmp['ultima_data']
+            except:
+                pass
+
             return {
                 "sucesso": True,
                 "codigo": cod_limpo,
                 "origem": transportadora_origem,
                 "ultimo_status": "Aguardando postagem / Informações eletrônicas recebidas",
-                "ultimo_local": "Origem (China / Transportadora)",
+                "ultimo_local": "China (Origem / Transportadora)" if cod_limpo.endswith("CN") else "Origem / Transportadora",
                 "ultima_data": data_agora,
                 "entregue": False,
                 "total_eventos": 1,
                 "historico": [
                     {
-                        "fase": "Origem",
+                        "fase": "China / Origem" if cod_limpo.endswith("CN") else "Origem",
                         "status": "Etiqueta criada pelo vendedor. Aguardando coleta física pela transportadora.",
-                        "local": "Origem",
+                        "local": "China (Origem)" if cod_limpo.endswith("CN") else "Origem",
                         "data": data_agora
                     }
                 ]
@@ -427,7 +437,16 @@ class RastreioCog(commands.Cog, name="Rastreio"):
         chaves_vistas = set()
 
         for ev in (historico_live + historico_db):
-            chave = f"{ev.get('data', '')}_{ev.get('status', '')}".strip()
+            st_limpo = ev.get('status', '').strip()
+            # Se for apenas a mensagem padrão de etiqueta criada, ignora duplicata de data diferente
+            if "etiqueta criada" in st_limpo.lower():
+                if "etiqueta_criada_vista" in chaves_vistas:
+                    continue
+                chaves_vistas.add("etiqueta_criada_vista")
+                eventos_finais.append(ev)
+                continue
+
+            chave = f"{ev.get('data', '')}_{st_limpo}".strip()
             if chave and chave not in chaves_vistas:
                 chaves_vistas.add(chave)
                 eventos_finais.append(ev)
@@ -452,13 +471,19 @@ class RastreioCog(commands.Cog, name="Rastreio"):
 
         embed = discord.Embed(
             title=f"📜 Histórico Completo: {nome_display}",
-            description=f"🔒 **Código:** `{cod_mascarado}` *(Protegido)*\n**Total de Eventos:** {len(eventos_finais)} marcos registrados",
+            description=f"🔒 **Código:** `{cod_mascarado}` *(Protegido)*\n**Total de Eventos:** {len(eventos_finais)} marco(s) registrado(s)",
             color=0x2ECC71 if is_entregue else 0xFF4646,
             timestamp=datetime.now()
         )
 
-        # Separa os eventos por blocos para caber perfeitamente no limite do Discord
-        eventos_china = [ev for ev in eventos_finais if "China" in ev.get("local", "") or "Guangzhou" in ev.get("status", "") or "Yangjiang" in ev.get("status", "") or "voo" in ev.get("status", "").lower() or "aérea" in ev.get("status", "").lower() or "510400" in ev.get("status", "") or "5299" in ev.get("status", "")]
+        # Separa os eventos por blocos (China/Origem vs Brasil/Destino)
+        eventos_china = [
+            ev for ev in eventos_finais 
+            if "China" in ev.get("local", "") or "China" in ev.get("fase", "") or "Origem" in ev.get("local", "") or "Origem" in ev.get("fase", "")
+            or "Guangzhou" in ev.get("status", "") or "Hangzhou" in ev.get("status", "") or "Yangjiang" in ev.get("status", "") or "Shenzhen" in ev.get("status", "")
+            or "voo" in ev.get("status", "").lower() or "aérea" in ev.get("status", "").lower() or "etiqueta criada" in ev.get("status", "").lower()
+            or "510400" in ev.get("status", "") or "5299" in ev.get("status", "")
+        ]
         eventos_brasil = [ev for ev in eventos_finais if ev not in eventos_china]
 
         if eventos_china:
