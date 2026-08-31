@@ -425,7 +425,7 @@ def consultar_codigo_duplo(codigo: str) -> Dict:
     }
 
 def mascarar_codigo(codigo: str) -> str:
-    """ Mascara os dígitos centrais do código para total privacidade e segurança (Ex: LZ452485036CN -> LZ45****036CN) """
+    """ Mascara os dígitos centrais do código para total privacidade e segurança (Ex: AA123456789BR -> AA12****789BR) """
     if not codigo:
         return ""
     cod = codigo.strip().upper()
@@ -519,7 +519,7 @@ class RastreioCog(commands.Cog, name="Rastreio"):
     # --- COMANDO SLASH: /rastrear ---
     @app_commands.command(name="rastrear", description="Rastreia encomendas da China e Correios com privacidade e alertas no PV.")
     @app_commands.describe(
-        codigo="Código de rastreio (ex: LZ464216116CN, NL123456789BR)",
+        codigo="Código de rastreio (ex: AA123456789BR, NL987654321BR)",
         nome="Nome ou apelido para o pacote (ex: Fone Bluetooth, Teclado Mecânico)",
         notificar_no_pv="Receber atualizações automáticas na sua Mensagem Direta (PV / DM)?",
         privado="Manter a visualização anônima e invisível para os outros no servidor?"
