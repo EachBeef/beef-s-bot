@@ -10,6 +10,8 @@ import urllib.parse
 from datetime import datetime
 from typing import Optional, List, Dict
 
+from cogs.criptografia import encriptar_dado, decriptar_dado
+
 def get_db_rastreio():
     conn = sqlite3.connect("banco.db", timeout=15)
     conn.row_factory = sqlite3.Row
@@ -19,6 +21,7 @@ def get_db_rastreio():
 def init_rastreio_db():
     conn = get_db_rastreio()
     with conn:
+        # Tabela de encomendas monitoradas
         conn.execute("""
             CREATE TABLE IF NOT EXISTS rastreios (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -37,6 +40,17 @@ def init_rastreio_db():
                 UNIQUE(codigo, user_id)
             )
         """)
+        
+        # Tabela de chaves de API Ship24 criptografadas por usuário
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS usuarios_ship24 (
+                user_id TEXT PRIMARY KEY,
+                api_key_enc TEXT NOT NULL,
+                criado_em INTEGER,
+                atualizado_em INTEGER
+            )
+        """)
+
         # Adiciona colunas se já existia a tabela antiga
         try:
             conn.execute("ALTER TABLE rastreios ADD COLUMN notificar_pv INTEGER DEFAULT 1")
@@ -49,6 +63,73 @@ def init_rastreio_db():
     conn.close()
 
 init_rastreio_db()
+
+# ===================================================
+#  GERENCIAMENTO DE CHAVE SHIP24 CRIPTOGRAFADA
+# ===================================================
+
+def obter_ship24_key(user_id: str) -> Optional[str]:
+    """ Busca e decripta a chave de API Ship24 exclusiva do usuário """
+    conn = get_db_rastreio()
+    row = conn.execute("SELECT api_key_enc FROM usuarios_ship24 WHERE user_id = ?", (str(user_id),)).fetchone()
+    conn.close()
+    if row and row['api_key_enc']:
+        try:
+            return decriptar_dado(row['api_key_enc'])
+        except Exception as e:
+            print(f"⚠️ Erro ao decriptar chave Ship24 do user {user_id}: {e}")
+    return None
+
+def salvar_ship24_key(user_id: str, api_key: str):
+    """ Encripta e armazena a chave de API Ship24 no banco de dados """
+    key_limpa = api_key.strip()
+    key_enc = encriptar_dado(key_limpa)
+    now = int(time.time())
+    conn = get_db_rastreio()
+    with conn:
+        conn.execute("""
+            INSERT INTO usuarios_ship24 (user_id, api_key_enc, criado_em, atualizado_em)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                api_key_enc = excluded.api_key_enc,
+                atualizado_em = excluded.atualizado_em
+        """, (str(user_id), key_enc, now, now))
+    conn.close()
+
+def remover_ship24_key(user_id: str) -> bool:
+    """ Remove a chave de API Ship24 do usuário """
+    conn = get_db_rastreio()
+    with conn:
+        c = conn.execute("DELETE FROM usuarios_ship24 WHERE user_id = ?", (str(user_id),))
+        removido = c.rowcount > 0
+    conn.close()
+    return removido
+
+def gerar_embed_tutorial_ship24() -> discord.Embed:
+    """ Gera o embed com o tutorial passo a passo para obter a chave gratuita no Ship24 """
+    embed = discord.Embed(
+        title="🔑 Configuração Necessária: Chave API Ship24",
+        description=(
+            "Para rastrear seus pedidos internacionais e nacionais em tempo real diretamente no Discord e receber alertas no PV, "
+            "você precisa configurar sua **chave gratuita do Ship24** (permite rastrear até **10 pedidos grátis por mês**).\n\n"
+            "🔒 **Sua chave é criptografada e de uso exclusivo da sua conta!**"
+        ),
+        color=0xFF4646
+    )
+    embed.add_field(
+        name="📖 Passo a Passo Simples (Leva menos de 1 minuto):",
+        value=(
+            "**1.** Acesse o site oficial: [ship24.com](https://www.ship24.com/)\n"
+            "**2.** Clique em **Sign Up** (ou Get Started) e cadastre-se com seu **Gmail / E-mail**.\n"
+            "**3.** No painel (Dashboard), acesse a aba **API** ou **API Management**.\n"
+            "**4.** Copie o seu **API Key (Token de Acesso)**.\n"
+            "**5.** Volte aqui no Discord e digite:\n"
+            "```/api24ship api_key:SUA_CHAVE_AQUI```"
+        ),
+        inline=False
+    )
+    embed.set_footer(text="Bife's Bot • Rastreamento Seguro com Criptografia Ponta a Ponta")
+    return embed
 
 # ===================================================
 #  DICIONÁRIO E MOTOR DE TRADUÇÃO CHINÊS -> PT-BR
@@ -132,7 +213,7 @@ def traduzir_para_pt(texto: str) -> str:
 
     # 3. Se ainda contiver caracteres chineses ou inglês técnico, usa Google Translate
     tem_chines = bool(re.search(r'[\u4e00-\u9fff]', texto_traduzido))
-    termos_ingles = any(w in texto_traduzido.lower() for w in ["delivered", "transit", "customs", "dispatch", "cleared", "departed", "arrival", "item"])
+    termos_ingles = any(w in texto_traduzido.lower() for w in ["delivered", "transit", "customs", "dispatch", "cleared", "departed", "arrival", "item", "carrier", "sorting", "hub", "handed over"])
     
     if tem_chines or termos_ingles:
         try:
@@ -159,11 +240,89 @@ def traduzir_para_pt(texto: str) -> str:
     return texto_traduzido
 
 # ===================================================
-#  MOTOR DUPLO DE RASTREAMENTO (CHINA 🇨🇳 + BRASIL 🇧🇷)
+#  MOTOR DE RASTREAMENTO SHIP24 + FALLBACK MULTI-CARRIER
 # ===================================================
 
+def consultar_ship24(codigo: str, api_key: str) -> Dict:
+    """ Consulta o status em tempo real na API oficial do Ship24 usando a chave do usuário """
+    cod_limpo = codigo.strip().upper()
+    url = "https://api.ship24.com/public/v1/trackers/track"
+    payload = json.dumps({"trackingNumber": cod_limpo}).encode('utf-8')
+    req = urllib.request.Request(url, data=payload, headers={
+        "Authorization": f"Bearer {api_key.strip()}",
+        "Content-Type": "application/json",
+        "User-Agent": "BifesBot/1.0"
+    })
+    
+    try:
+        with urllib.request.urlopen(req, timeout=12) as r:
+            data = json.loads(r.read().decode('utf-8'))
+            data_track = data.get("data", {}).get("trackings", [])
+            if not data_track:
+                data_track = data.get("trackings", [])
+            
+            if data_track:
+                tracking_obj = data_track[0]
+                events_raw = tracking_obj.get("events", [])
+                shipment_info = tracking_obj.get("shipment", {})
+                courier_code = shipment_info.get("courierCode", "") or "Internacional"
+                
+                eventos_unificados = []
+                for ev in events_raw:
+                    st_raw = ev.get("status", "") or ev.get("statusMilestone", "")
+                    st_pt = traduzir_para_pt(st_raw)
+                    loc_raw = ev.get("location", "")
+                    loc_pt = traduzir_para_pt(loc_raw) if loc_raw else "Trânsito"
+                    dt_raw = ev.get("datetime", "")
+                    if dt_raw:
+                        dt_clean = dt_raw.replace("T", " ")[:16]
+                    else:
+                        dt_clean = datetime.now().strftime("%Y-%m-%d %H:%M")
+                        
+                    eventos_unificados.append({
+                        "fase": "China Post / Internacional" if ("china" in courier_code.lower() or "China" in loc_pt or cod_limpo.endswith("CN")) else "Correios / Destino",
+                        "status": st_pt,
+                        "local": loc_pt,
+                        "data": dt_clean
+                    })
+                    
+                is_entregue = shipment_info.get("statusMilestone") == "delivered" or any("entregue" in ev["status"].lower() or "já entregue" in ev["status"].lower() for ev in eventos_unificados)
+                
+                if eventos_unificados:
+                    return {
+                        "sucesso": True,
+                        "codigo": cod_limpo,
+                        "origem": f"Ship24 ({courier_code}) ➡️ Correios",
+                        "ultimo_status": eventos_unificados[0]["status"],
+                        "ultimo_local": eventos_unificados[0]["local"],
+                        "ultima_data": eventos_unificados[0]["data"],
+                        "entregue": is_entregue,
+                        "total_eventos": len(eventos_unificados),
+                        "historico": eventos_unificados
+                    }
+    except urllib.error.HTTPError as he:
+        if he.code in (401, 403):
+            return {
+                "sucesso": False,
+                "codigo": cod_limpo,
+                "msg": "❌ Sua chave Ship24 é inválida ou atingiu o limite da cota mensal. Atualize-a com `/api24ship`."
+            }
+        elif he.code == 404:
+            return {
+                "sucesso": False,
+                "codigo": cod_limpo,
+                "msg": "❌ Código de rastreio não encontrado na Ship24. Verifique se o código está correto."
+            }
+        else:
+            print(f"⚠️ [Ship24] Erro HTTP {he.code}: {he.reason}")
+    except Exception as e:
+        print(f"⚠️ [Ship24] Erro de conexão: {e}")
+        
+    # Se a Ship24 não retornou ou deu erro temporário, tenta o fallback local
+    return consultar_codigo_duplo(cod_limpo)
+
 def consultar_codigo_duplo(codigo: str) -> Dict:
-    """ Consulta a jornada completa nas duas pontas (China Post + Correios Brasil) """
+    """ Consulta a jornada completa nas duas pontas (China Post + Correios Brasil) como fallback """
     cod_limpo = codigo.strip().upper()
     eventos_unificados = []
     transportadora_origem = "China Post" if cod_limpo.endswith("CN") else "Internacional"
@@ -203,110 +362,10 @@ def consultar_codigo_duplo(codigo: str) -> Dict:
     except Exception as e:
         print(f"⚠️ [Cainiao] Erro na consulta de {cod_limpo}: {e}")
 
-    # --- 2. CONSULTA PONTA 2: CORREIOS BRASIL (com fallback multi-provider) ---
-    correios_ok = False
-
-    # Provider A: LinkTrack API (pode estar fora do ar)
-    if not correios_ok:
-        try:
-            url_lt = f"https://api.linketrack.com/track/json?user=teste&token=1abcd00b2731640e886fb41a8a9671ad143c3d4b4f1682cc64c832a24cee11a2&codigo={cod_limpo}"
-            req_lt = urllib.request.Request(url_lt, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req_lt, timeout=8) as r:
-                data_lt = json.loads(r.read().decode('utf-8'))
-                eventos_br = data_lt.get("eventos", [])
-                if eventos_br:
-                    for ev in eventos_br:
-                        st_br = traduzir_para_pt(ev.get("status", ""))
-                        loc_br = f"{ev.get('local', '')} {ev.get('origem', '')} {ev.get('destino', '')}".strip() or "Correios Brasil"
-                        dt_br = f"{ev.get('data', '')} {ev.get('hora', '')}".strip()
-                        eventos_unificados.append({
-                            "fase": "Correios Brasil",
-                            "status": st_br,
-                            "local": loc_br,
-                            "data": dt_br,
-                            "timestamp": 0
-                        })
-                    correios_ok = True
-                    print(f"✅ [LinkTrack] {len(eventos_br)} eventos para {cod_limpo}")
-        except Exception as e:
-            print(f"⚠️ [LinkTrack] Falha: {e}")
-
-    # Provider B: Correios Web Rastreamento (scraping do site oficial)
-    if not correios_ok:
-        try:
-            import ssl
-            url_web = f"https://rastreamento.correios.com.br/app/resultado.php"
-            data_post = urllib.parse.urlencode({"objetos": cod_limpo}).encode('utf-8')
-            req_web = urllib.request.Request(url_web, data=data_post, headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Referer": "https://rastreamento.correios.com.br/",
-                "Origin": "https://rastreamento.correios.com.br"
-            })
-            ctx = ssl.create_default_context()
-            with urllib.request.urlopen(req_web, timeout=10, context=ctx) as r:
-                data_web = json.loads(r.read().decode('utf-8'))
-                if data_web.get("erro") != "true" and data_web.get("objetos"):
-                    for obj in data_web.get("objetos", []):
-                        for ev in obj.get("eventos", []):
-                            st_br = traduzir_para_pt(ev.get("descricao", ""))
-                            unidade = ev.get("unidade", {})
-                            loc_br = f"{unidade.get('tipo', '')} - {unidade.get('endereco', {}).get('cidade', '')} / {unidade.get('endereco', {}).get('uf', '')}".strip(" -/") or "Correios Brasil"
-                            dt_br = ev.get("dtHrCriado", "")[:16].replace("T", " ") if ev.get("dtHrCriado") else ""
-                            eventos_unificados.append({
-                                "fase": "Correios Brasil",
-                                "status": st_br,
-                                "local": loc_br,
-                                "data": dt_br,
-                                "timestamp": 0
-                            })
-                    correios_ok = True
-                    print(f"✅ [Correios Web] Eventos encontrados para {cod_limpo}")
-        except Exception as e:
-            print(f"⚠️ [Correios Web] Falha: {e}")
-
-    # Provider C: Correios proxyapp (app mobile - requer token válido)
-    if not correios_ok:
-        try:
-            import ssl
-            url_proxy = f"https://proxyapp.correios.com.br/v1/sro-rastro/{cod_limpo}"
-            req_proxy = urllib.request.Request(url_proxy, headers={
-                "User-Agent": "Dart/3.4 (dart:io)",
-                "Accept": "application/json"
-            })
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-            with urllib.request.urlopen(req_proxy, timeout=8, context=ctx) as r:
-                data_proxy = json.loads(r.read().decode('utf-8'))
-                objetos = data_proxy.get("objetos", [])
-                if objetos:
-                    for obj in objetos:
-                        for ev in obj.get("eventos", []):
-                            st_br = traduzir_para_pt(ev.get("descricao", ""))
-                            unidade = ev.get("unidade", {})
-                            loc_br = f"{unidade.get('nome', '')} - {unidade.get('endereco', {}).get('cidade', '')} / {unidade.get('endereco', {}).get('uf', '')}".strip(" -/") or "Correios Brasil"
-                            dt_br = ev.get("dtHrCriado", "")[:16].replace("T", " ") if ev.get("dtHrCriado") else ""
-                            eventos_unificados.append({
-                                "fase": "Correios Brasil",
-                                "status": st_br,
-                                "local": loc_br,
-                                "data": dt_br,
-                                "timestamp": 0
-                            })
-                    correios_ok = True
-                    print(f"✅ [Correios Proxy] Eventos encontrados para {cod_limpo}")
-        except Exception as e:
-            print(f"⚠️ [Correios Proxy] Falha: {e}")
-
-    if not correios_ok:
-        print(f"⚠️ [Correios] Nenhum provider retornou dados para {cod_limpo}")
-
-    # --- 3. SE NÃO ENCONTROU EVENTOS (PACOTE RECÉM-CRIADO) ---
+    # --- 2. SE NÃO ENCONTROU EVENTOS (PACOTE RECÉM-CRIADO) ---
     if not eventos_unificados:
         is_valido = re.match(r'^[A-Z]{2}\d{9}[A-Z]{2}$', cod_limpo) or cod_limpo.startswith("LP")
         if is_valido:
-            # Tenta preservar a data de cadastro original do banco
             data_agora = datetime.now().strftime("%Y-%m-%d %H:%M")
             try:
                 conn_tmp = get_db_rastreio()
@@ -342,7 +401,7 @@ def consultar_codigo_duplo(codigo: str) -> Dict:
                 "msg": "Código não encontrado ou inválido."
             }
 
-    # --- 4. ORGANIZAÇÃO DO HISTÓRICO ---
+    # --- 3. ORGANIZAÇÃO DO HISTÓRICO ---
     ultimo = eventos_unificados[0]
     status_final = ultimo["status"]
     local_final = ultimo["local"]
@@ -378,16 +437,16 @@ def get_status_emoji(status: str) -> str:
         return "✅"
     if "saiu para entrega" in s or "providenciar entrega" in s or "out for delivery" in s:
         return "🛵"
-    if "aduaneira" in s or "fiscalização" in s or "curitiba" in s or "imposto" in s or "pagamento" in s:
+    if "aduaneira" in s or "fiscalização" in s or "curitiba" in s or "imposto" in s or "pagamento" in s or "customs" in s:
         return "🛃"
-    if "trânsito" in s or "encaminhado" in s or "transferência" in s or "avião" in s or "voo" in s or "aérea" in s:
+    if "trânsito" in s or "transit" in s or "encaminhado" in s or "transferência" in s or "avião" in s or "voo" in s or "aérea" in s or "flight" in s:
         return "✈️"
-    if "postado" in s or "recebido" in s or "posted" in s or "classificada" in s:
+    if "postado" in s or "recebido" in s or "posted" in s or "classificada" in s or "info_received" in s or "etiqueta criada" in s:
         return "📦"
     return "🚚"
 
 # ===================================================
-#  COG DE RASTREAMENTO DISCORD
+#  COG DE RASTREAMENTO DISCORD COM AUTENTICAÇÃO SHIP24
 # ===================================================
 
 class RastreioCog(commands.Cog, name="Rastreio"):
@@ -398,26 +457,85 @@ class RastreioCog(commands.Cog, name="Rastreio"):
     def cog_unload(self):
         self.verificar_rastreios_loop.cancel()
 
+    # --- COMANDO SLASH: /api24ship ---
+    @app_commands.command(name="api24ship", description="Configura sua chave de API exclusiva e gratuita do Ship24 (com criptografia).")
+    @app_commands.describe(api_key="Sua chave de API do Ship24 (pegue grátis em ship24.com)")
+    async def slash_api24ship(self, interaction: discord.Interaction, api_key: str):
+        key_limpa = api_key.strip()
+        if len(key_limpa) < 10:
+            await interaction.response.send_message(
+                "❌ Chave de API inválida! Ela deve ser uma chave válida fornecida no painel do [ship24.com](https://www.ship24.com/).",
+                ephemeral=True
+            )
+            return
+
+        salvar_ship24_key(str(interaction.user.id), key_limpa)
+        key_mascarada = key_limpa[:4] + "****" + key_limpa[-4:] if len(key_limpa) >= 8 else "****"
+
+        embed = discord.Embed(
+            title="🔒 Chave API Ship24 Configurada com Sucesso!",
+            description=(
+                f"Sua chave **`{key_mascarada}`** foi **criptografada com segurança** e vinculada exclusivamente à sua conta.\n\n"
+                "✨ **Você já pode usar:**\n"
+                "• `/rastrear <codigo> [nome]` — Rastrear novas encomendas com alertas no PV.\n"
+                "• `/historico_rastreio <codigo>` — Ver a linha do tempo completa passo a passo."
+            ),
+            color=0x2ECC71
+        )
+        embed.set_footer(text="Bife's Bot • Segurança e Privacidade Garantidas")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    # --- COMANDO SLASH: /minha_api24ship ---
+    @app_commands.command(name="minha_api24ship", description="Verifica se você possui uma chave API do Ship24 cadastrada.")
+    async def slash_minha_api24ship(self, interaction: discord.Interaction):
+        key = obter_ship24_key(str(interaction.user.id))
+        if not key:
+            embed = gerar_embed_tutorial_ship24()
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+
+        key_mascarada = key[:4] + "****" + key[-4:] if len(key) >= 8 else "****"
+        embed = discord.Embed(
+            title="🔑 Sua Chave API Ship24",
+            description=f"Status: ✅ **Ativa e Criptografada**\nChave: `{key_mascarada}`",
+            color=0x2ECC71
+        )
+        embed.set_footer(text="Para alterar, use /api24ship. Para remover, use /remover_api24ship.")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    # --- COMANDO SLASH: /remover_api24ship ---
+    @app_commands.command(name="remover_api24ship", description="Remove sua chave API do Ship24 salva no bot.")
+    async def slash_remover_api24ship(self, interaction: discord.Interaction):
+        removido = remover_ship24_key(str(interaction.user.id))
+        if removido:
+            await interaction.response.send_message("🗑️ Sua chave API Ship24 foi removida com sucesso.", ephemeral=True)
+        else:
+            await interaction.response.send_message("⚠️ Você não tinha nenhuma chave Ship24 cadastrada.", ephemeral=True)
+
     # --- COMANDO SLASH: /rastrear ---
     @app_commands.command(name="rastrear", description="Rastreia encomendas da China e Correios com privacidade e alertas no PV.")
     @app_commands.describe(
-        codigo="Código de rastreio (ex: LZ452485036CN, NL123456789BR)",
+        codigo="Código de rastreio (ex: LZ464216116CN, NL123456789BR)",
         nome="Nome ou apelido para o pacote (ex: Fone Bluetooth, Teclado Mecânico)",
         notificar_no_pv="Receber atualizações automáticas na sua Mensagem Direta (PV / DM)?",
         privado="Manter a visualização anônima e invisível para os outros no servidor?"
     )
     async def slash_rastrear(self, interaction: discord.Interaction, codigo: str, nome: Optional[str] = "Minha Encomenda", notificar_no_pv: Optional[bool] = True, privado: Optional[bool] = True):
+        # 1. Verifica se o usuário possui a chave Ship24 configurada
+        user_key = obter_ship24_key(str(interaction.user.id))
+        if not user_key:
+            embed_tutorial = gerar_embed_tutorial_ship24()
+            await interaction.response.send_message(embed=embed_tutorial, ephemeral=True)
+            return
+
         await interaction.response.defer(thinking=True, ephemeral=privado)
         
         cod_limpo = codigo.strip().upper()
-        res = consultar_codigo_duplo(cod_limpo)
+        res = consultar_ship24(cod_limpo, user_key)
         
         if not res.get("sucesso"):
-            await interaction.followup.send(
-                f"❌ Não foi possível encontrar informações para o código **`{mascarar_codigo(cod_limpo)}`**.\n"
-                f"💡 *Verifique se digitou corretamente ou se o pacote foi postado recentemente.*",
-                ephemeral=True
-            )
+            msg_erro = res.get("msg", f"Não foi possível encontrar informações para `{mascarar_codigo(cod_limpo)}`.")
+            await interaction.followup.send(f"❌ {msg_erro}", ephemeral=True)
             return
 
         # Salva no banco de dados SQLite com histórico completo
@@ -447,7 +565,7 @@ class RastreioCog(commands.Cog, name="Rastreio"):
 
         cod_mascarado = mascarar_codigo(cod_limpo)
         emoji = get_status_emoji(res["ultimo_status"])
-        cor = 0x2ECC71 if res["entregue"] else (0xF1C40F if "aduaneira" in res["ultimo_status"].lower() or "pagamento" in res["ultimo_status"].lower() else 0xFF4646)
+        cor = 0x2ECC71 if res["entregue"] else (0xF1C40F if "aduaneira" in res["ultimo_status"].lower() or "pagamento" in res["ultimo_status"].lower() or "customs" in res["ultimo_status"].lower() else 0xFF4646)
         
         embed = discord.Embed(
             title=f"{emoji} Rastreio: {nome}",
@@ -488,10 +606,17 @@ class RastreioCog(commands.Cog, name="Rastreio"):
     @app_commands.command(name="historico_rastreio", description="Exibe a linha do tempo completa e protegida de uma encomenda.")
     @app_commands.describe(codigo="Código de rastreio", privado="Manter visualização invisível para os outros no servidor?")
     async def slash_historico_rastreio(self, interaction: discord.Interaction, codigo: str, privado: Optional[bool] = True):
+        # 1. Verifica se o usuário possui a chave Ship24 configurada
+        user_key = obter_ship24_key(str(interaction.user.id))
+        if not user_key:
+            embed_tutorial = gerar_embed_tutorial_ship24()
+            await interaction.response.send_message(embed=embed_tutorial, ephemeral=True)
+            return
+
         await interaction.response.defer(thinking=True, ephemeral=privado)
         cod_limpo = codigo.strip().upper()
         
-        # 1. Busca no banco de dados local primeiro
+        # 2. Busca no banco de dados local primeiro
         conn = get_db_rastreio()
         row = conn.execute("SELECT * FROM rastreios WHERE codigo = ? AND user_id = ?", (cod_limpo, str(interaction.user.id))).fetchone()
         if not row:
@@ -505,17 +630,16 @@ class RastreioCog(commands.Cog, name="Rastreio"):
             except:
                 pass
 
-        # 2. Consulta a API ao vivo
-        res = consultar_codigo_duplo(cod_limpo)
+        # 3. Consulta a API Ship24 com a chave do usuário
+        res = consultar_ship24(cod_limpo, user_key)
         historico_live = res.get("historico", []) if res.get("sucesso") else []
 
-        # 3. Mescla eventos evitando duplicatas
+        # 4. Mescla eventos evitando duplicatas
         eventos_finais = []
         chaves_vistas = set()
 
         for ev in (historico_live + historico_db):
             st_limpo = ev.get('status', '').strip()
-            # Se for apenas a mensagem padrão de etiqueta criada, ignora duplicata de data diferente
             if "etiqueta criada" in st_limpo.lower():
                 if "etiqueta_criada_vista" in chaves_vistas:
                     continue
@@ -532,7 +656,7 @@ class RastreioCog(commands.Cog, name="Rastreio"):
             await interaction.followup.send(f"📦 Nenhum histórico disponível ainda para **`{mascarar_codigo(cod_limpo)}`**.", ephemeral=True)
             return
 
-        # 4. Atualiza o banco com o histórico mesclado
+        # 5. Atualiza o banco com o histórico mesclado
         conn_up = get_db_rastreio()
         with conn_up:
             conn_up.execute("""
@@ -645,9 +769,9 @@ class RastreioCog(commands.Cog, name="Rastreio"):
         conn.close()
 
         if removidos > 0:
-            await interaction.response.send_message(f"🗑️ O pacote **`{cod_limpo}`** foi removido do seu monitoramento.", ephemeral=True)
+            await interaction.response.send_message(f"🗑️ O pacote **`{mascarar_codigo(cod_limpo)}`** foi removido do seu monitoramento.", ephemeral=True)
         else:
-            await interaction.response.send_message(f"⚠️ Pacote **`{cod_limpo}`** não encontrado na sua lista.", ephemeral=True)
+            await interaction.response.send_message(f"⚠️ Pacote **`{mascarar_codigo(cod_limpo)}`** não encontrado na sua lista.", ephemeral=True)
 
     # ===================================================
     #  LOOP DE VERIFICAÇÃO AUTOMÁTICA EM SEGUNDO PLANO
@@ -672,8 +796,13 @@ class RastreioCog(commands.Cog, name="Rastreio"):
                 ultimo_status_antigo = p["ultimo_status"] or ""
                 notificar_pv = p["notificar_pv"] if "notificar_pv" in p.keys() else 1
                 
-                # Consulta status atualizado nas duas pontas
-                res = consultar_codigo_duplo(cod)
+                # Busca chave Ship24 do usuário
+                user_key = obter_ship24_key(user_id)
+                if user_key:
+                    res = consultar_ship24(cod, user_key)
+                else:
+                    res = consultar_codigo_duplo(cod)
+
                 if not res.get("sucesso"):
                     continue
 
@@ -699,11 +828,11 @@ class RastreioCog(commands.Cog, name="Rastreio"):
 
                     cod_masc = mascarar_codigo(cod)
                     emoji = get_status_emoji(novo_status)
-                    cor = 0x2ECC71 if is_entregue else (0xF1C40F if "aduaneira" in novo_status.lower() or "pagamento" in novo_status.lower() else 0xFF4646)
+                    cor = 0x2ECC71 if is_entregue else (0xF1C40F if "aduaneira" in novo_status.lower() or "pagamento" in novo_status.lower() or "customs" in novo_status.lower() else 0xFF4646)
 
                     embed = discord.Embed(
                         title=f"🔔 Atualização: {p['nome_pacote']}",
-                        description=f"📦 **Pacote:** {p['nome_pacote']}\n🔒 **Código:** `{cod_masc}`\n🚚 **Rota:** {res.get('origem', 'China Post / Correios')}",
+                        description=f"📦 **Pacote:** {p['nome_pacote']}\n🔒 **Código:** `{cod_masc}`\n🚚 **Rota:** {res.get('origem', 'Ship24 / Correios')}",
                         color=cor,
                         timestamp=datetime.now()
                     )
