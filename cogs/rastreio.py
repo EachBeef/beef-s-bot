@@ -217,7 +217,7 @@ def traduzir_para_pt(texto: str) -> str:
 
     # 3. Se ainda contiver caracteres chineses ou inglês técnico, usa Google Translate
     tem_chines = bool(re.search(r'[\u4e00-\u9fff]', texto_traduzido))
-    termos_ingles = any(w in texto_traduzido.lower() for w in ["delivered", "transit", "customs", "dispatch", "cleared", "departed", "arrival", "item", "carrier", "sorting", "hub", "handed over"])
+    termos_ingles = any(w in texto_traduzido.lower() for w in ["delivered", "transit", "customs", "dispatch", "cleared", "departed", "arrival", "item", "carrier", "sorting", "hub", "handed over", "posting", "collection", "accepted", "received", "export", "import"])
     
     if tem_chines or termos_ingles:
         try:
