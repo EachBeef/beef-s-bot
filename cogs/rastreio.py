@@ -203,27 +203,104 @@ def consultar_codigo_duplo(codigo: str) -> Dict:
     except Exception as e:
         print(f"⚠️ [Cainiao] Erro na consulta de {cod_limpo}: {e}")
 
-    # --- 2. CONSULTA PONTA 2: CORREIOS BRASIL ---
-    try:
-        url_correios = f"https://api.linketrack.com/track/json?user=teste&token=1abcd00b2731640e886fb41a8a9671ad143c3d4b4f1682cc64c832a24cee11a2&codigo={cod_limpo}"
-        req_correios = urllib.request.Request(url_correios, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req_correios, timeout=8) as r:
-            data_correios = json.loads(r.read().decode('utf-8'))
-            eventos_br = data_correios.get("eventos", [])
-            for ev in eventos_br:
-                st_br = traduzir_para_pt(ev.get("status", ""))
-                loc_br = f"{ev.get('local', '')} {ev.get('origem', '')} {ev.get('destino', '')}".strip() or "Correios Brasil"
-                dt_br = f"{ev.get('data', '')} {ev.get('hora', '')}".strip()
-                
-                eventos_unificados.append({
-                    "fase": "Correios Brasil",
-                    "status": st_br,
-                    "local": loc_br,
-                    "data": dt_br,
-                    "timestamp": 0
-                })
-    except Exception as e:
-        pass
+    # --- 2. CONSULTA PONTA 2: CORREIOS BRASIL (com fallback multi-provider) ---
+    correios_ok = False
+
+    # Provider A: LinkTrack API (pode estar fora do ar)
+    if not correios_ok:
+        try:
+            url_lt = f"https://api.linketrack.com/track/json?user=teste&token=1abcd00b2731640e886fb41a8a9671ad143c3d4b4f1682cc64c832a24cee11a2&codigo={cod_limpo}"
+            req_lt = urllib.request.Request(url_lt, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req_lt, timeout=8) as r:
+                data_lt = json.loads(r.read().decode('utf-8'))
+                eventos_br = data_lt.get("eventos", [])
+                if eventos_br:
+                    for ev in eventos_br:
+                        st_br = traduzir_para_pt(ev.get("status", ""))
+                        loc_br = f"{ev.get('local', '')} {ev.get('origem', '')} {ev.get('destino', '')}".strip() or "Correios Brasil"
+                        dt_br = f"{ev.get('data', '')} {ev.get('hora', '')}".strip()
+                        eventos_unificados.append({
+                            "fase": "Correios Brasil",
+                            "status": st_br,
+                            "local": loc_br,
+                            "data": dt_br,
+                            "timestamp": 0
+                        })
+                    correios_ok = True
+                    print(f"✅ [LinkTrack] {len(eventos_br)} eventos para {cod_limpo}")
+        except Exception as e:
+            print(f"⚠️ [LinkTrack] Falha: {e}")
+
+    # Provider B: Correios Web Rastreamento (scraping do site oficial)
+    if not correios_ok:
+        try:
+            import ssl
+            url_web = f"https://rastreamento.correios.com.br/app/resultado.php"
+            data_post = urllib.parse.urlencode({"objetos": cod_limpo}).encode('utf-8')
+            req_web = urllib.request.Request(url_web, data=data_post, headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Referer": "https://rastreamento.correios.com.br/",
+                "Origin": "https://rastreamento.correios.com.br"
+            })
+            ctx = ssl.create_default_context()
+            with urllib.request.urlopen(req_web, timeout=10, context=ctx) as r:
+                data_web = json.loads(r.read().decode('utf-8'))
+                if data_web.get("erro") != "true" and data_web.get("objetos"):
+                    for obj in data_web.get("objetos", []):
+                        for ev in obj.get("eventos", []):
+                            st_br = traduzir_para_pt(ev.get("descricao", ""))
+                            unidade = ev.get("unidade", {})
+                            loc_br = f"{unidade.get('tipo', '')} - {unidade.get('endereco', {}).get('cidade', '')} / {unidade.get('endereco', {}).get('uf', '')}".strip(" -/") or "Correios Brasil"
+                            dt_br = ev.get("dtHrCriado", "")[:16].replace("T", " ") if ev.get("dtHrCriado") else ""
+                            eventos_unificados.append({
+                                "fase": "Correios Brasil",
+                                "status": st_br,
+                                "local": loc_br,
+                                "data": dt_br,
+                                "timestamp": 0
+                            })
+                    correios_ok = True
+                    print(f"✅ [Correios Web] Eventos encontrados para {cod_limpo}")
+        except Exception as e:
+            print(f"⚠️ [Correios Web] Falha: {e}")
+
+    # Provider C: Correios proxyapp (app mobile - requer token válido)
+    if not correios_ok:
+        try:
+            import ssl
+            url_proxy = f"https://proxyapp.correios.com.br/v1/sro-rastro/{cod_limpo}"
+            req_proxy = urllib.request.Request(url_proxy, headers={
+                "User-Agent": "Dart/3.4 (dart:io)",
+                "Accept": "application/json"
+            })
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            with urllib.request.urlopen(req_proxy, timeout=8, context=ctx) as r:
+                data_proxy = json.loads(r.read().decode('utf-8'))
+                objetos = data_proxy.get("objetos", [])
+                if objetos:
+                    for obj in objetos:
+                        for ev in obj.get("eventos", []):
+                            st_br = traduzir_para_pt(ev.get("descricao", ""))
+                            unidade = ev.get("unidade", {})
+                            loc_br = f"{unidade.get('nome', '')} - {unidade.get('endereco', {}).get('cidade', '')} / {unidade.get('endereco', {}).get('uf', '')}".strip(" -/") or "Correios Brasil"
+                            dt_br = ev.get("dtHrCriado", "")[:16].replace("T", " ") if ev.get("dtHrCriado") else ""
+                            eventos_unificados.append({
+                                "fase": "Correios Brasil",
+                                "status": st_br,
+                                "local": loc_br,
+                                "data": dt_br,
+                                "timestamp": 0
+                            })
+                    correios_ok = True
+                    print(f"✅ [Correios Proxy] Eventos encontrados para {cod_limpo}")
+        except Exception as e:
+            print(f"⚠️ [Correios Proxy] Falha: {e}")
+
+    if not correios_ok:
+        print(f"⚠️ [Correios] Nenhum provider retornou dados para {cod_limpo}")
 
     # --- 3. SE NÃO ENCONTROU EVENTOS (PACOTE RECÉM-CRIADO) ---
     if not eventos_unificados:
