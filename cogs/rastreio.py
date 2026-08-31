@@ -248,11 +248,11 @@ def traduzir_para_pt(texto: str) -> str:
 # ===================================================
 
 def consultar_ship24(codigo: str, api_key: str) -> Dict:
-    """ Consulta o status em tempo real na API oficial do Ship24 forçando China Post + Correios Brasil """
+    """ Consulta o status em tempo real na API oficial do Ship24 """
     cod_limpo = codigo.strip().upper()
     url = "https://api.ship24.com/public/v1/trackers/track"
 
-    # Monta payload forçando China Post (Origem) e Correios (Destino) simultaneamente
+    # Monta payload válido conforme a especificação do Ship24
     payload_dict = {
         "trackingNumber": cod_limpo,
         "destinationCountryCode": "BR"
@@ -260,9 +260,6 @@ def consultar_ship24(codigo: str, api_key: str) -> Dict:
     
     if cod_limpo.endswith("CN") or cod_limpo.startswith("LP") or cod_limpo.startswith("LZ") or cod_limpo.startswith("LM"):
         payload_dict["originCountryCode"] = "CN"
-        payload_dict["courierCode"] = ["china-post", "correios-brazil"]
-    else:
-        payload_dict["courierCode"] = ["correios-brazil"]
 
     payload = json.dumps(payload_dict).encode('utf-8')
     req = urllib.request.Request(url, data=payload, headers={
@@ -272,7 +269,7 @@ def consultar_ship24(codigo: str, api_key: str) -> Dict:
     })
     
     try:
-        with urllib.request.urlopen(req, timeout=12) as r:
+        with urllib.request.urlopen(req, timeout=15) as r:
             data = json.loads(r.read().decode('utf-8'))
             data_track = data.get("data", {}).get("trackings", [])
             if not data_track:
@@ -318,6 +315,8 @@ def consultar_ship24(codigo: str, api_key: str) -> Dict:
                         "historico": eventos_unificados
                     }
     except urllib.error.HTTPError as he:
+        err_body = he.read().decode('utf-8', errors='ignore')
+        print(f"⚠️ [Ship24] Erro HTTP {he.code}: {err_body}")
         if he.code in (401, 403):
             return {
                 "sucesso": False,
@@ -330,8 +329,6 @@ def consultar_ship24(codigo: str, api_key: str) -> Dict:
                 "codigo": cod_limpo,
                 "msg": "❌ Código de rastreio não encontrado na Ship24. Verifique se o código está correto."
             }
-        else:
-            print(f"⚠️ [Ship24] Erro HTTP {he.code}: {he.reason}")
     except Exception as e:
         print(f"⚠️ [Ship24] Erro de conexão: {e}")
         
