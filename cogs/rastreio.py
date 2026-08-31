@@ -143,6 +143,8 @@ DICIONARIO_CHINES = {
     # Cidades e Províncias Principais de E-commerce
     "广州市": "Guangzhou",
     "广州": "Guangzhou",
+    "江门市": "Jiangmen",
+    "江门": "Jiangmen",
     "阳江市": "Yangjiang",
     "阳江": "Yangjiang",
     "深圳市": "Shenzhen",
@@ -187,10 +189,15 @@ DICIONARIO_CHINES = {
     "已妥投": "Objeto entregue ao destinatário",
     "安排投递": "Saiu para entrega",
     "邮件已在": "A encomenda foi classificada em",
+    "邮件": "A encomenda",
     "收寄": "China Post recebeu a correspondência",
     "中国邮政": "China Post",
     
-    # Termos em Inglês de APIs Internacionais (Ship24 / UPU)
+    # Termos em Inglês / Traduções Críticas
+    "O e-mail": "A encomenda",
+    "o e-mail": "a encomenda",
+    "Bureau Internacional de Intercâmbio": "Centro de Tratamento e Intercâmbio Internacional",
+    "Oficina de Embalagem": "Centro de Triagem de Encomendas",
     "Posting/Collection": "Objeto postado / Recebido na agência postal da China",
     "posting/collection": "Objeto postado / Recebido na agência postal da China",
     "Postagem/Coleta": "Objeto postado / Recebido na agência postal da China",
