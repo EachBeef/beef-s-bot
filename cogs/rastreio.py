@@ -60,6 +60,10 @@ def init_rastreio_db():
             conn.execute("ALTER TABLE rastreios ADD COLUMN historico_json TEXT")
         except:
             pass
+        try:
+            conn.execute("ALTER TABLE rastreios ADD COLUMN entregue_em INTEGER DEFAULT 0")
+        except:
+            pass
     conn.close()
 
 init_rastreio_db()
@@ -543,10 +547,13 @@ class RastreioCog(commands.Cog, name="Rastreio"):
         now_ts = int(time.time())
         pv_flag = 1 if notificar_no_pv else 0
         hist_json = json.dumps(res.get("historico", []), ensure_ascii=False)
+        entregue_val = 1 if res["entregue"] else 0
+        entregue_em_val = now_ts if res["entregue"] else 0
+
         with conn:
             conn.execute("""
-                INSERT INTO rastreios (codigo, nome_pacote, user_id, channel_id, ultimo_status, ultimo_local, ultima_data, entregue, origem, notificar_pv, historico_json, criado_em)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO rastreios (codigo, nome_pacote, user_id, channel_id, ultimo_status, ultimo_local, ultima_data, entregue, origem, notificar_pv, historico_json, entregue_em, criado_em)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(codigo, user_id) DO UPDATE SET 
                     nome_pacote=excluded.nome_pacote,
                     channel_id=excluded.channel_id,
@@ -555,11 +562,12 @@ class RastreioCog(commands.Cog, name="Rastreio"):
                     ultima_data=excluded.ultima_data,
                     notificar_pv=excluded.notificar_pv,
                     historico_json=excluded.historico_json,
+                    entregue_em=CASE WHEN excluded.entregue = 1 AND rastreios.entregue_em = 0 THEN excluded.entregue_em ELSE rastreios.entregue_em END,
                     entregue=excluded.entregue
             """, (
                 cod_limpo, nome, str(interaction.user.id), str(interaction.channel_id),
                 res["ultimo_status"], res["ultimo_local"], res["ultima_data"],
-                1 if res["entregue"] else 0, res["origem"], pv_flag, hist_json, now_ts
+                entregue_val, res["origem"], pv_flag, hist_json, entregue_em_val, now_ts
             ))
         conn.close()
 
@@ -778,7 +786,41 @@ class RastreioCog(commands.Cog, name="Rastreio"):
     # ===================================================
     @tasks.loop(minutes=25)
     async def verificar_rastreios_loop(self):
-        """ Percorre encomendas pendentes e notifica no PV ou Canal se houver atualização """
+        """ Percorre encomendas pendentes, notifica no PV/Canal e faz a limpeza automática após 5 dias da entrega """
+        now_ts = int(time.time())
+        CINCO_DIAS = 5 * 86400  # 5 dias em segundos (432.000s)
+
+        # --- 1. LIMPEZA AUTOMÁTICA: Remove pacotes entregues há mais de 5 dias para liberar cota ---
+        try:
+            conn_clean = get_db_rastreio()
+            with conn_clean:
+                c_del = conn_clean.execute(
+                    "SELECT id, codigo, nome_pacote, user_id, notificar_pv FROM rastreios WHERE entregue = 1 AND entregue_em > 0 AND (? - entregue_em) >= ?",
+                    (now_ts, CINCO_DIAS)
+                )
+                expirados = c_del.fetchall()
+                if expirados:
+                    for exp in expirados:
+                        conn_clean.execute("DELETE FROM rastreios WHERE id = ?", (exp['id'],))
+                        print(f"🧹 [Auto-Cleanup] Pacote {exp['codigo']} ({exp['nome_pacote']}) removido após 5 dias da entrega.")
+                        
+                        # Notifica o usuário no PV avisando que foi arquivado
+                        if exp['notificar_pv']:
+                            try:
+                                u = await self.bot.fetch_user(int(exp['user_id']))
+                                if u:
+                                    cod_masc = mascarar_codigo(exp['codigo'])
+                                    await u.send(
+                                        f"📦 **Seu pacote `{exp['nome_pacote']}` (`{cod_masc}`) foi arquivado com sucesso!**\n"
+                                        f"*(Já se passaram 5 dias desde a entrega, então ele foi removido do monitoramento para liberar sua cota do Ship24).* ✨"
+                                    )
+                            except Exception as e_warn:
+                                pass
+            conn_clean.close()
+        except Exception as e_clean:
+            print(f"⚠️ Erro no auto-cleanup de 5 dias: {e_clean}")
+
+        # --- 2. VERIFICAÇÃO DE ENCOMENDAS ATIVAS ---
         conn = get_db_rastreio()
         c = conn.cursor()
         c.execute("SELECT * FROM rastreios WHERE entregue = 0")
@@ -810,6 +852,7 @@ class RastreioCog(commands.Cog, name="Rastreio"):
                 novo_local = res["ultimo_local"]
                 nova_data = res["ultima_data"]
                 is_entregue = 1 if res["entregue"] else 0
+                entregue_em_val = now_ts if res["entregue"] else 0
                 hist_json = json.dumps(res.get("historico", []), ensure_ascii=False)
 
                 # Se o status ou data mudaram, NOTIFICA!
@@ -821,9 +864,10 @@ class RastreioCog(commands.Cog, name="Rastreio"):
                     with conn_up:
                         conn_up.execute("""
                             UPDATE rastreios 
-                            SET ultimo_status = ?, ultimo_local = ?, ultima_data = ?, historico_json = ?, entregue = ?
+                            SET ultimo_status = ?, ultimo_local = ?, ultima_data = ?, historico_json = ?, entregue = ?,
+                                entregue_em = CASE WHEN ? = 1 AND (entregue_em IS NULL OR entregue_em = 0) THEN ? ELSE entregue_em END
                             WHERE codigo = ? AND user_id = ?
-                        """, (novo_status, novo_local, nova_data, hist_json, is_entregue, cod, user_id))
+                        """, (novo_status, novo_local, nova_data, hist_json, is_entregue, is_entregue, entregue_em_val, cod, user_id))
                     conn_up.close()
 
                     cod_masc = mascarar_codigo(cod)
