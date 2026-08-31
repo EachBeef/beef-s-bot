@@ -248,10 +248,23 @@ def traduzir_para_pt(texto: str) -> str:
 # ===================================================
 
 def consultar_ship24(codigo: str, api_key: str) -> Dict:
-    """ Consulta o status em tempo real na API oficial do Ship24 usando a chave do usuário """
+    """ Consulta o status em tempo real na API oficial do Ship24 forçando China Post + Correios Brasil """
     cod_limpo = codigo.strip().upper()
     url = "https://api.ship24.com/public/v1/trackers/track"
-    payload = json.dumps({"trackingNumber": cod_limpo}).encode('utf-8')
+
+    # Monta payload forçando China Post (Origem) e Correios (Destino) simultaneamente
+    payload_dict = {
+        "trackingNumber": cod_limpo,
+        "destinationCountryCode": "BR"
+    }
+    
+    if cod_limpo.endswith("CN") or cod_limpo.startswith("LP") or cod_limpo.startswith("LZ") or cod_limpo.startswith("LM"):
+        payload_dict["originCountryCode"] = "CN"
+        payload_dict["courierCode"] = ["china-post", "correios-brazil"]
+    else:
+        payload_dict["courierCode"] = ["correios-brazil"]
+
+    payload = json.dumps(payload_dict).encode('utf-8')
     req = urllib.request.Request(url, data=payload, headers={
         "Authorization": f"Bearer {api_key.strip()}",
         "Content-Type": "application/json",
