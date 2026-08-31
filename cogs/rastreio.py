@@ -188,8 +188,79 @@ DICIONARIO_CHINES = {
     "安排投递": "Saiu para entrega",
     "邮件已在": "A encomenda foi classificada em",
     "收寄": "China Post recebeu a correspondência",
-    "中国邮政": "China Post"
+    "中国邮政": "China Post",
+    
+    # Termos em Inglês de APIs Internacionais (Ship24 / UPU)
+    "Posting/Collection": "Objeto postado / Recebido na agência postal da China",
+    "posting/collection": "Objeto postado / Recebido na agência postal da China",
+    "Postagem/Coleta": "Objeto postado / Recebido na agência postal da China",
+    "Postagem / Coleta": "Objeto postado / Recebido na agência postal da China",
+    "Posting": "Objeto postado na agência postal",
+    "Collection": "Coletado pela transportadora",
+    "Departure from outward office of exchange": "Despachado do Centro de Intercâmbio Internacional para o exterior",
+    "Arrival at inward office of exchange": "Chegou ao Centro de Tratamento Internacional no país de destino",
+    "Handed over to carrier": "Entregue à companhia aérea transportadora",
+    "Held by customs": "Retido pela fiscalização aduaneira",
+    "Customs clearance": "Desembaraço aduaneiro concluído",
+    "Item returned from customs": "Liberado pela alfândega",
+    "Out for delivery": "Objeto saiu para entrega ao destinatário",
+    "Delivered": "Objeto entregue ao destinatário",
+    "In transit": "Objeto em trânsito"
 }
+
+# ===================================================
+#  MAPEAMENTO DE CÓDIGOS POSTAIS (CEPs DA CHINA)
+# ===================================================
+
+POSTCODES_CHINA = {
+    "510": "Guangzhou, Guangdong (China)",
+    "518": "Shenzhen, Guangdong (China)",
+    "529": "Jiangmen / Yangjiang, Guangdong (China)",
+    "523": "Dongguan, Guangdong (China)",
+    "528": "Foshan, Guangdong (China)",
+    "516": "Huizhou, Guangdong (China)",
+    "515": "Shantou, Guangdong (China)",
+    "514": "Meizhou, Guangdong (China)",
+    "512": "Shaoguan, Guangdong (China)",
+    "310": "Hangzhou, Zhejiang (China)",
+    "322": "Yiwu / Jinhua, Zhejiang (China)",
+    "315": "Ningbo, Zhejiang (China)",
+    "325": "Wenzhou, Zhejiang (China)",
+    "317": "Taizhou, Zhejiang (China)",
+    "313": "Huzhou, Zhejiang (China)",
+    "200": "Shanghai (China)",
+    "201": "Shanghai (China)",
+    "100": "Beijing (China)",
+    "350": "Fuzhou, Fujian (China)",
+    "361": "Xiamen, Fujian (China)",
+    "362": "Quanzhou, Fujian (China)",
+    "210": "Nanjing, Jiangsu (China)",
+    "215": "Suzhou, Jiangsu (China)",
+    "430": "Wuhan, Hubei (China)",
+    "610": "Chengdu, Sichuan (China)",
+    "400": "Chongqing (China)",
+    "710": "Xi'an, Shaanxi (China)"
+}
+
+def formatar_local_rastreio(local_raw: str) -> str:
+    """ Formata códigos postais e siglas para descrições amigáveis e claras em português """
+    if not local_raw:
+        return "China / Internacional"
+    
+    loc = local_raw.strip()
+    
+    # Se for um CEP chinês numérico de 6 dígitos (ex: 529080, 510400, 322000)
+    if re.match(r'^\d{6}$', loc):
+        pref = loc[:3]
+        if pref in POSTCODES_CHINA:
+            return f"Centro de Triagem / Agência em {POSTCODES_CHINA[pref]} [CEP {loc}]"
+        return f"Centro de Triagem Postal na China [CEP {loc}]"
+    
+    # Se for código de 5 dígitos
+    if re.match(r'^\d{5}$', loc):
+        return f"Agência Postal na China [Código {loc}]"
+        
+    return traduzir_para_pt(loc)
 
 def traduzir_para_pt(texto: str) -> str:
     """ Traduz e normaliza expressões chinesas ou inglesas para Português """
@@ -286,7 +357,7 @@ def consultar_ship24(codigo: str, api_key: str) -> Dict:
                     st_raw = ev.get("status", "") or ev.get("statusMilestone", "")
                     st_pt = traduzir_para_pt(st_raw)
                     loc_raw = ev.get("location", "")
-                    loc_pt = traduzir_para_pt(loc_raw) if loc_raw else "Trânsito"
+                    loc_pt = formatar_local_rastreio(loc_raw)
                     dt_raw = ev.get("datetime", "")
                     if dt_raw:
                         dt_clean = dt_raw.replace("T", " ")[:16]
